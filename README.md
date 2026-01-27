@@ -4,17 +4,26 @@ MIT License
 
 基于 ESM-2 的蛋白质突变评分与后处理工具。
 
-## 命令
+## 功能
 
-### 模型打分流程 (从基因组生成)
+- **VCF 注释**: 使用预打分文件批量注释 VCF
+- **ClinVar 基准测试**: 过滤、拆分、阈值校准、性能评估
+
+## 安装
+
+### 基础安装（推荐，用于预打分文件流程）
 
 ```bash
-# 1. 全基因组突变评分 → Parquet
-evoscore2 score-all --genome hg38.fa --gff annotation.gff3 --output scores.parquet
-
-# 2. Parquet 转 VCF（推荐）
-evoscore2 to-vcf --scores scores.parquet --output scores.vcf.gz
+pip install -e .
 ```
+
+### 完整安装（包含 ESM-2 模型打分功能）
+
+```bash
+pip install -e .[model]
+```
+
+## 命令
 
 ### 基于预打分文件流程 (hg38_VESM_3B_scores.parquet.gzip)
 
@@ -42,8 +51,12 @@ evoscore2 calibrate --input split_results/train.csv --output threshold.json --sp
 evoscore2 benchmark --input split_results/test.csv --threshold -4.5 --output benchmark.json
 ```
 
-## 安装
+### 模型打分流程（需要 `.[model]` 依赖）
 
 ```bash
-pip install -e .
+# 1. 全基因组突变评分 → Parquet
+evoscore2 score-all --genome hg38.fa --gff annotation.gff3 --output scores.parquet
+
+# 2. Parquet 转 VCF
+evoscore2 to-vcf --scores scores.parquet --output scores.vcf.gz
 ```

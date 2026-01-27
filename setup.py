@@ -9,12 +9,9 @@ setup(
     packages=find_packages(),
     python_requires=">=3.6",
     install_requires=[
-        "torch>=2.0.0",
-        "transformers>=4.30.0",
         "numpy>=1.24.0",
         "pandas>=2.0.0",
         "pysam>=0.21.0",
-        "gffutils>=0.12",
         "biopython>=1.81",
         "scikit-learn>=1.3.0",
         "pytabix>=0.0.2",
@@ -23,9 +20,11 @@ setup(
         "pyarrow>=12.0.0",
         "fastparquet>=2023.0.0",
         "typing_extensions>=4.0.0",
+        "aiocontextvars>=0.2.0",  # Python 3.6 backport for loguru
     ],
     extras_require={
         "dev": ["pytest>=7.0.0", "black>=23.0.0"],
+        "model": ["torch>=2.0.0", "transformers>=4.30.0", "gffutils>=0.12"],
     },
     entry_points={
         "console_scripts": [
