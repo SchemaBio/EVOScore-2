@@ -67,8 +67,33 @@ def cmd_to_vcf(args):
     """Parquet 转 VCF"""
     import pandas as pd
     from .vcf_generator import VCFGenerator
+    import gzip
 
-    df = pd.read_parquet(args.scores)
+    # 处理 .parquet.gzip 压缩文件
+    if args.scores.endswith(".parquet.gzip") or args.scores.endswith(".gz"):
+        with gzip.open(args.scores, 'rb') as f:
+            df = pd.read_parquet(f)
+    else:
+        df = pd.read_parquet(args.scores)
+
+    # 标准化列名 (处理 "VESM (3B)" 这种特殊列名)
+    column_mapping = {
+        "VESM (3B)": "score",
+        "VESM(3B)": "score",
+        "VESM_3B": "score",
+        "VESM": "score",
+        "EVOScore": "score",
+    }
+    for old_col, new_col in column_mapping.items():
+        if old_col in df.columns:
+            df = df.rename(columns={old_col: new_col})
+
+    # 确保必需列存在
+    required_cols = ["CHROM", "POS", "REF", "ALT", "score"]
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
+
     generator = VCFGenerator(None, None)
     records = generator.dataframe_to_records(df)
     generator.save_vcf(records, args.output)
@@ -77,14 +102,37 @@ def cmd_to_vcf(args):
 
 # ==================== 基于预打分文件流程 ====================
 
-def cmd_query(args):
-    """查询单个位点分数"""
+def _load_scores(args):
+    """加载分数文件，统一处理列名"""
     import pandas as pd
+    import gzip
 
-    if args.scores.endswith(".parquet"):
+    if args.scores.endswith(".parquet.gzip") or args.scores.endswith(".parquet.gz"):
+        with gzip.open(args.scores, 'rb') as f:
+            df = pd.read_parquet(f)
+    elif args.scores.endswith(".parquet"):
         df = pd.read_parquet(args.scores)
     else:
         df = pd.read_csv(args.scores, sep="\t")
+
+    # 标准化列名
+    column_mapping = {
+        "VESM (3B)": "score",
+        "VESM(3B)": "score",
+        "VESM_3B": "score",
+        "VESM": "score",
+        "EVOScore": "score",
+    }
+    for old_col, new_col in column_mapping.items():
+        if old_col in df.columns:
+            df = df.rename(columns={old_col: new_col})
+
+    return df
+
+
+def cmd_query(args):
+    """查询单个位点分数"""
+    df = _load_scores(args)
 
     # 精确匹配
     mask = (
@@ -108,14 +156,10 @@ def cmd_query(args):
 
 def cmd_annotate(args):
     """VCF 批量注释"""
-    import pandas as pd
     import pysam
 
     # 加载分数文件
-    if args.scores.endswith(".parquet"):
-        scores_df = pd.read_parquet(args.scores)
-    else:
-        scores_df = pd.read_csv(args.scores, sep="\t")
+    scores_df = _load_scores(args)
 
     # 构建查询索引
     scores_dict = {}
@@ -163,10 +207,7 @@ def cmd_split_clinvar(args):
     records = ClinVarFilter.load_filtered_vcf(args.input)
 
     # 加载分数
-    if args.scores.endswith(".parquet"):
-        scores_df = pd.read_parquet(args.scores)
-    else:
-        scores_df = pd.read_csv(args.scores, sep="\t")
+    scores_df = _load_scores(args)
 
     scores_dict = {
         (str(row["CHROM"]), int(row["POS"]), str(row["REF"]), str(row["ALT"])): row["score"]

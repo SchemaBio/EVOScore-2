@@ -12,7 +12,7 @@ MIT License
 # 1. 全基因组突变评分 → Parquet
 evoscore2 score-all --genome hg38.fa --gff annotation.gff3 --output scores.parquet
 
-# 2. Parquet 转 VCF
+# 2. Parquet 转 VCF（推荐）
 evoscore2 to-vcf --scores scores.parquet --output scores.vcf.gz
 ```
 
