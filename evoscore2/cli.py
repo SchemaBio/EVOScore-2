@@ -419,6 +419,14 @@ def _load_scores(args):
     return df
 
 
+def _normalize_chrom(chrom):
+    """标准化染色体名称（去除 chr 前缀）"""
+    chrom = str(chrom)
+    if chrom.startswith("chr"):
+        return chrom[3:]
+    return chrom
+
+
 def _load_scores_for_variants(scores_path, query_keys):
     """
     高效加载指定变异位点的分数（使用 Polars 流式处理）
@@ -457,16 +465,29 @@ def _load_scores_for_variants(scores_path, query_keys):
     if score_col and score_col != "score":
         lf = lf.rename({score_col: "score"})
 
-    # 构建查询 DataFrame
+    # 标准化查询键的 CHROM（去除 chr 前缀）
+    normalized_query = {}
+    for k in query_keys:
+        norm_chrom = _normalize_chrom(k[0])
+        norm_key = (norm_chrom, k[1], k[2], k[3])
+        normalized_query[norm_key] = k  # 映射回原始键
+
+    # 构建查询 DataFrame（使用标准化的 CHROM）
     query_data = {
-        "CHROM": [k[0] for k in query_keys],
-        "POS": [k[1] for k in query_keys],
-        "REF": [k[2] for k in query_keys],
-        "ALT": [k[3] for k in query_keys],
+        "CHROM_NORM": [k[0] for k in normalized_query.keys()],
+        "POS": [k[1] for k in normalized_query.keys()],
+        "REF": [k[2] for k in normalized_query.keys()],
+        "ALT": [k[3] for k in normalized_query.keys()],
     }
     query_df = pl.DataFrame(query_data)
 
-    # 分块处理，避免内存溢出
+    # 显示样本数据用于调试
+    sample = lf.head(3).collect()
+    logger.debug(f"Scores file sample CHROM: {sample['CHROM'].to_list()}")
+    sample_query = list(query_keys)[:3]
+    logger.debug(f"Query sample CHROM: {[k[0] for k in sample_query]}")
+
+    # 分块处理
     chunk_size = 5_000_000
     total_rows = pl.scan_parquet(scores_path).select(pl.len()).collect().item()
 
@@ -475,9 +496,9 @@ def _load_scores_for_variants(scores_path, query_keys):
     for offset in range(0, total_rows, chunk_size):
         chunk = lf.slice(offset, chunk_size).collect()
 
-        # 确保类型一致
+        # 标准化 CHROM 列（去除 chr 前缀）
         chunk = chunk.with_columns([
-            pl.col("CHROM").cast(pl.Utf8),
+            pl.col("CHROM").cast(pl.Utf8).str.replace("^chr", "").alias("CHROM_NORM"),
             pl.col("REF").cast(pl.Utf8),
             pl.col("ALT").cast(pl.Utf8),
         ])
@@ -485,16 +506,20 @@ def _load_scores_for_variants(scores_path, query_keys):
         # 内连接找到匹配的行
         matched = chunk.join(
             query_df,
-            on=["CHROM", "POS", "REF", "ALT"],
+            on=["CHROM_NORM", "POS", "REF", "ALT"],
             how="inner"
         )
 
-        # 添加到结果字典
+        # 添加到结果字典（使用原始的查询键）
         for row in matched.iter_rows(named=True):
-            key = (str(row["CHROM"]), int(row["POS"]), str(row["REF"]), str(row["ALT"]))
-            scores_dict[key] = row["score"]
+            norm_key = (row["CHROM_NORM"], int(row["POS"]), str(row["REF"]), str(row["ALT"]))
+            if norm_key in normalized_query:
+                orig_key = normalized_query[norm_key]
+                scores_dict[orig_key] = row["score"]
 
-        logger.debug(f"Processed {min(offset + chunk_size, total_rows)}/{total_rows}, found {len(scores_dict)} matches")
+        processed = min(offset + chunk_size, total_rows)
+        if offset == 0 or processed == total_rows or len(scores_dict) > 0:
+            logger.info(f"Progress: {processed}/{total_rows}, found {len(scores_dict)} matches")
 
     return scores_dict
 
