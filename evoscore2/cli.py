@@ -77,10 +77,8 @@ def cmd_score_all(args):
 
 
 def cmd_to_vcf(args):
-    """Parquet 转 VCF（流式处理，大文件友好，支持 GPU 加速）"""
-    import pandas as pd
+    """Parquet 转 VCF（支持多种后端：polars/pandas/cudf）"""
     import gzip
-    from .vcf_generator import VCFGenerator
 
     # 标准化列名映射
     column_mapping = {
@@ -91,40 +89,40 @@ def cmd_to_vcf(args):
         "EVOScore": "score",
     }
 
-    # 检测是否使用 GPU
-    use_gpu = getattr(args, 'use_gpu', False) and check_gpu_available()
-    if getattr(args, 'use_gpu', False) and not use_gpu:
-        logger.warning("GPU requested but not available (need CUDA + cuDF). Falling back to CPU.")
-    if use_gpu:
-        logger.info("Using GPU acceleration with cuDF")
-
-    # 确定文件类型并设置读取方式
+    # 确定文件类型
     is_gzip_parquet = args.scores.endswith(".parquet.gzip") or args.scores.endswith(".parquet.gz")
     is_parquet = args.scores.endswith(".parquet") or is_gzip_parquet
 
+    # 确定使用的后端
+    backend = getattr(args, 'backend', 'auto')
+
+    if backend == 'auto':
+        # 自动选择：优先 polars > cudf > pandas
+        try:
+            import polars
+            backend = 'polars'
+        except ImportError:
+            if check_gpu_available():
+                backend = 'cudf'
+            else:
+                backend = 'pandas'
+        logger.info(f"Auto-selected backend: {backend}")
+
+    # 根据后端选择处理函数
     if is_parquet:
-        # GPU 加速路径
-        if use_gpu:
-            _to_vcf_gpu(args, column_mapping, is_gzip_parquet)
-        else:
+        if backend == 'polars':
+            _to_vcf_polars(args, column_mapping)
+        elif backend == 'cudf':
+            if not check_gpu_available():
+                logger.warning("cuDF not available, falling back to pandas")
+                _to_vcf_cpu(args, column_mapping, is_gzip_parquet)
+            else:
+                _to_vcf_gpu(args, column_mapping, is_gzip_parquet)
+        else:  # pandas
             _to_vcf_cpu(args, column_mapping, is_gzip_parquet)
-
     else:
-        # CSV 文件（全量读取，小文件适用）
-        df = pd.read_csv(args.scores, sep="\t")
-        for old_col, new_col in column_mapping.items():
-            if old_col in df.columns:
-                df = df.rename(columns={old_col: new_col})
-
-        required_cols = ["CHROM", "POS", "REF", "ALT", "score"]
-        for col in required_cols:
-            if col not in df.columns:
-                raise ValueError(f"Missing required column: {col}")
-
-        generator = VCFGenerator(None, None)
-        records = generator.dataframe_to_records(df)
-        generator.save_vcf(records, args.output)
-        logger.info(f"Converted {len(records)} records to VCF: {args.output}")
+        # CSV 文件使用 pandas
+        _to_vcf_csv(args, column_mapping)
 
 
 def _to_vcf_cpu(args, column_mapping, is_gzip_parquet):
@@ -192,6 +190,90 @@ def _to_vcf_cpu(args, column_mapping, is_gzip_parquet):
             generator.save_vcf_to_file(records, f, append=True)
 
     logger.info(f"Converted to VCF: {args.output}")
+
+
+def _to_vcf_polars(args, column_mapping):
+    """Polars 高性能版本的 Parquet 转 VCF（向量化操作）"""
+    import gzip
+    import polars as pl
+
+    logger.info("Using Polars backend (high performance)...")
+
+    # 读取 parquet（Polars 原生支持，自动处理内部压缩）
+    df = pl.read_parquet(args.scores)
+    col_names = df.columns
+
+    # 检查必需列
+    required_cols = ["CHROM", "POS", "REF", "ALT"]
+    if not all(c in col_names for c in required_cols):
+        raise ValueError(f"Missing required columns. Found: {col_names}")
+
+    # 找到 score 列并重命名
+    score_col = None
+    for old_col in column_mapping.keys():
+        if old_col in col_names:
+            score_col = old_col
+            break
+    if score_col is None and "score" in col_names:
+        score_col = "score"
+    if score_col is None:
+        raise ValueError(f"No score column found. Available: {col_names}")
+
+    if score_col != "score":
+        df = df.rename({score_col: "score"})
+
+    logger.info(f"Converting {len(df)} records (Polars)...")
+
+    # 向量化生成 VCF 行（避免 Python 循环）
+    vcf_lines = df.select([
+        pl.col("CHROM").cast(pl.Utf8),
+        pl.lit("\t"),
+        pl.col("POS").cast(pl.Utf8),
+        pl.lit("\t.\t"),
+        pl.col("REF").cast(pl.Utf8),
+        pl.lit("\t"),
+        pl.col("ALT").cast(pl.Utf8),
+        pl.lit("\t.\t.\tEVOScore="),
+        pl.col("score").round(4).cast(pl.Utf8),
+    ]).select(pl.concat_str(pl.all()).alias("line"))
+
+    # 写入文件
+    open_func = gzip.open if args.output.endswith(".gz") else open
+    mode = "wt" if args.output.endswith(".gz") else "w"
+
+    with open_func(args.output, mode) as f:
+        # 写入 VCF 头
+        f.write("##fileformat=VCFv4.2\n")
+        f.write('##INFO=<ID=EVOScore,Number=1,Type=Float,Description="ESM-2 based pathogenicity score">\n')
+        f.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
+
+        # 批量写入数据行
+        lines = vcf_lines["line"].to_list()
+        f.write("\n".join(lines))
+        f.write("\n")
+
+    logger.info(f"Converted to VCF: {args.output}")
+
+
+def _to_vcf_csv(args, column_mapping):
+    """CSV 文件转 VCF（使用 pandas）"""
+    import pandas as pd
+    from .vcf_generator import VCFGenerator
+
+    df = pd.read_csv(args.scores, sep="\t")
+    for old_col, new_col in column_mapping.items():
+        if old_col in df.columns:
+            df = df.rename(columns={old_col: new_col})
+
+    required_cols = ["CHROM", "POS", "REF", "ALT", "score"]
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
+
+    generator = VCFGenerator(None, None)
+    records = generator.dataframe_to_records(df)
+    generator.save_vcf(records, args.output)
+    logger.info(f"Converted {len(records)} records to VCF: {args.output}")
 
 
 def _to_vcf_gpu(args, column_mapping, is_gzip_parquet):
@@ -498,8 +580,8 @@ def main():
     p2 = subparsers.add_parser("to-vcf", help="Convert Parquet to VCF")
     p2.add_argument("--scores", required=True, help="Input Parquet file")
     p2.add_argument("--output", required=True, help="Output VCF path")
-    p2.add_argument("--use-gpu", action="store_true", dest="use_gpu",
-                    help="Use GPU acceleration with cuDF (requires CUDA + cuDF)")
+    p2.add_argument("--backend", default="auto", choices=["auto", "polars", "pandas", "cudf"],
+                    help="Processing backend: auto (default), polars (recommended), pandas, cudf (GPU)")
 
     # ---- 基于预打分文件流程 ----
     p3 = subparsers.add_parser("query", help="Query single variant score")
