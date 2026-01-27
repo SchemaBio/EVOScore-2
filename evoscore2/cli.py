@@ -16,6 +16,19 @@ import os
 from loguru import logger
 
 
+def check_gpu_available() -> bool:
+    """检测是否有可用的 GPU 和 cuDF"""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        # 检查 cuDF 是否可用
+        import cudf
+        return True
+    except ImportError:
+        return False
+
+
 def setup_logger(debug: bool = False):
     """配置日志"""
     logger.remove()
@@ -64,7 +77,7 @@ def cmd_score_all(args):
 
 
 def cmd_to_vcf(args):
-    """Parquet 转 VCF（流式处理，大文件友好）"""
+    """Parquet 转 VCF（流式处理，大文件友好，支持 GPU 加速）"""
     import pandas as pd
     import gzip
     from .vcf_generator import VCFGenerator
@@ -78,80 +91,23 @@ def cmd_to_vcf(args):
         "EVOScore": "score",
     }
 
+    # 检测是否使用 GPU
+    use_gpu = getattr(args, 'use_gpu', False) and check_gpu_available()
+    if getattr(args, 'use_gpu', False) and not use_gpu:
+        logger.warning("GPU requested but not available (need CUDA + cuDF). Falling back to CPU.")
+    if use_gpu:
+        logger.info("Using GPU acceleration with cuDF")
+
     # 确定文件类型并设置读取方式
     is_gzip_parquet = args.scores.endswith(".parquet.gzip") or args.scores.endswith(".parquet.gz")
     is_parquet = args.scores.endswith(".parquet") or is_gzip_parquet
 
     if is_parquet:
-        from pyarrow.parquet import ParquetFile
-        import pyarrow as pa
-
-        # 尝试 gzip 方式
-        if is_gzip_parquet:
-            try:
-                with gzip.open(args.scores, 'rb') as f:
-                    pf = ParquetFile(f)
-            except gzip.BadGzipFile:
-                pf = ParquetFile(args.scores)
+        # GPU 加速路径
+        if use_gpu:
+            _to_vcf_gpu(args, column_mapping, is_gzip_parquet)
         else:
-            pf = ParquetFile(args.scores)
-
-        # 获取列名并检查必需列
-        schema = pf.schema_arrow
-        col_names = [s.name for s in schema]
-        required_cols = ["CHROM", "POS", "REF", "ALT"]
-
-        # 检查是否有 score 列（可能有不同名称）
-        score_col = None
-        for old_col, new_col in column_mapping.items():
-            if old_col in col_names:
-                score_col = old_col
-                break
-        if score_col is None and "score" in col_names:
-            score_col = "score"
-
-        if not all(c in col_names for c in required_cols):
-            raise ValueError(f"Missing required columns. Found: {col_names}")
-        if score_col is None:
-            raise ValueError(f"No score column found. Available: {col_names}")
-
-        logger.info(f"Converting {pf.metadata.num_rows} records...")
-
-        # 初始化 VCF 生成器
-        generator = VCFGenerator(None, None)
-
-        # 打开输出 VCF（支持 .gz 压缩）
-        open_func = gzip.open if args.output.endswith(".gz") else open
-        mode = "wt" if args.output.endswith(".gz") else "w"
-
-        # 先读取第一块获取列信息，写入表头
-        first_batch = pf.read_row_group(0)
-        first_df = first_batch.to_pandas()
-        for old_col, new_col in column_mapping.items():
-            if old_col in first_df.columns:
-                first_df = first_df.rename(columns={old_col: new_col})
-
-        records = generator.dataframe_to_records(first_df)
-
-        with open_func(args.output, mode) as f:
-            generator.save_vcf_to_file(records, f)
-
-        # 分块处理剩余数据
-        n_rows = pf.metadata.num_rows
-        batch_size = pf.metadata.row_group(0).num_rows
-        total_groups = pf.metadata.num_row_groups
-
-        for i in range(1, total_groups):
-            batch = pf.read_row_group(i)
-            df = batch.to_pandas()
-            for old_col, new_col in column_mapping.items():
-                if old_col in df.columns:
-                    df = df.rename(columns={old_col: new_col})
-            records = generator.dataframe_to_records(df)
-            with open_func(args.output, "at" if args.output.endswith(".gz") else "a") as f:
-                generator.save_vcf_to_file(records, f, append=True)
-
-        logger.info(f"Converted to VCF: {args.output}")
+            _to_vcf_cpu(args, column_mapping, is_gzip_parquet)
 
     else:
         # CSV 文件（全量读取，小文件适用）
@@ -169,6 +125,161 @@ def cmd_to_vcf(args):
         records = generator.dataframe_to_records(df)
         generator.save_vcf(records, args.output)
         logger.info(f"Converted {len(records)} records to VCF: {args.output}")
+
+
+def _to_vcf_cpu(args, column_mapping, is_gzip_parquet):
+    """CPU 版本的 Parquet 转 VCF"""
+    import gzip
+    from pyarrow.parquet import ParquetFile
+    from .vcf_generator import VCFGenerator
+
+    # 尝试 gzip 方式
+    if is_gzip_parquet:
+        try:
+            with gzip.open(args.scores, 'rb') as f:
+                pf = ParquetFile(f)
+        except gzip.BadGzipFile:
+            pf = ParquetFile(args.scores)
+    else:
+        pf = ParquetFile(args.scores)
+
+    # 获取列名并检查必需列
+    schema = pf.schema_arrow
+    col_names = [s.name for s in schema]
+    required_cols = ["CHROM", "POS", "REF", "ALT"]
+
+    # 检查是否有 score 列
+    score_col = None
+    for old_col in column_mapping.keys():
+        if old_col in col_names:
+            score_col = old_col
+            break
+    if score_col is None and "score" in col_names:
+        score_col = "score"
+
+    if not all(c in col_names for c in required_cols):
+        raise ValueError(f"Missing required columns. Found: {col_names}")
+    if score_col is None:
+        raise ValueError(f"No score column found. Available: {col_names}")
+
+    logger.info(f"Converting {pf.metadata.num_rows} records (CPU)...")
+
+    generator = VCFGenerator(None, None)
+    open_func = gzip.open if args.output.endswith(".gz") else open
+    mode = "wt" if args.output.endswith(".gz") else "w"
+
+    # 处理第一块
+    first_batch = pf.read_row_group(0)
+    first_df = first_batch.to_pandas()
+    for old_col, new_col in column_mapping.items():
+        if old_col in first_df.columns:
+            first_df = first_df.rename(columns={old_col: new_col})
+
+    records = generator.dataframe_to_records(first_df)
+    with open_func(args.output, mode) as f:
+        generator.save_vcf_to_file(records, f)
+
+    # 分块处理剩余数据
+    total_groups = pf.metadata.num_row_groups
+    for i in range(1, total_groups):
+        batch = pf.read_row_group(i)
+        df = batch.to_pandas()
+        for old_col, new_col in column_mapping.items():
+            if old_col in df.columns:
+                df = df.rename(columns={old_col: new_col})
+        records = generator.dataframe_to_records(df)
+        with open_func(args.output, "at" if args.output.endswith(".gz") else "a") as f:
+            generator.save_vcf_to_file(records, f, append=True)
+
+    logger.info(f"Converted to VCF: {args.output}")
+
+
+def _to_vcf_gpu(args, column_mapping, is_gzip_parquet):
+    """GPU 加速版本的 Parquet 转 VCF（使用 cuDF）"""
+    import gzip
+    import cudf
+    from .vcf_generator import VCFGenerator
+
+    tmp_path = None
+    scores_path = args.scores
+
+    # 检测文件是否真的是 gzip 压缩的（检查魔数）
+    def is_real_gzip(filepath):
+        with open(filepath, 'rb') as f:
+            magic = f.read(2)
+            return magic == b'\x1f\x8b'
+
+    # 如果扩展名暗示 gzip 且文件确实是 gzip 压缩的
+    if is_gzip_parquet and is_real_gzip(args.scores):
+        import tempfile
+        import shutil
+        logger.info("Decompressing gzip parquet for GPU processing...")
+        with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
+            tmp_path = tmp.name
+            with gzip.open(args.scores, 'rb') as f_in:
+                shutil.copyfileobj(f_in, tmp)
+        scores_path = tmp_path
+    elif is_gzip_parquet:
+        # 扩展名是 .gzip 但实际不是 gzip 压缩，直接读取
+        logger.debug("File has .gzip extension but is not gzip compressed, reading directly")
+
+    try:
+        # 使用 cuDF 读取 parquet（GPU 加速）
+        gdf = cudf.read_parquet(scores_path)
+        col_names = list(gdf.columns)
+        required_cols = ["CHROM", "POS", "REF", "ALT"]
+
+        # 检查是否有 score 列
+        score_col = None
+        for old_col in column_mapping.keys():
+            if old_col in col_names:
+                score_col = old_col
+                break
+        if score_col is None and "score" in col_names:
+            score_col = "score"
+
+        if not all(c in col_names for c in required_cols):
+            raise ValueError(f"Missing required columns. Found: {col_names}")
+        if score_col is None:
+            raise ValueError(f"No score column found. Available: {col_names}")
+
+        # 在 GPU 上重命名列
+        for old_col, new_col in column_mapping.items():
+            if old_col in gdf.columns:
+                gdf = gdf.rename(columns={old_col: new_col})
+
+        logger.info(f"Converting {len(gdf)} records (GPU)...")
+
+        # 分块转换并写入（避免一次性转换太多数据到 CPU）
+        chunk_size = 1_000_000  # 每次处理 100 万行
+        generator = VCFGenerator(None, None)
+        open_func = gzip.open if args.output.endswith(".gz") else open
+        mode = "wt" if args.output.endswith(".gz") else "w"
+
+        total_rows = len(gdf)
+        first_chunk = True
+
+        for start in range(0, total_rows, chunk_size):
+            end = min(start + chunk_size, total_rows)
+            # 在 GPU 上切片，然后转换到 CPU
+            chunk_gdf = gdf.iloc[start:end]
+            chunk_df = chunk_gdf.to_pandas()
+
+            records = generator.dataframe_to_records(chunk_df)
+            append_mode = "at" if args.output.endswith(".gz") else "a"
+
+            with open_func(args.output, mode if first_chunk else append_mode) as f:
+                generator.save_vcf_to_file(records, f, append=not first_chunk)
+
+            first_chunk = False
+            logger.debug(f"Processed {end}/{total_rows} records")
+
+        logger.info(f"Converted to VCF: {args.output}")
+
+    finally:
+        # 清理临时文件
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 # ==================== 基于预打分文件流程 ====================
@@ -387,6 +498,8 @@ def main():
     p2 = subparsers.add_parser("to-vcf", help="Convert Parquet to VCF")
     p2.add_argument("--scores", required=True, help="Input Parquet file")
     p2.add_argument("--output", required=True, help="Output VCF path")
+    p2.add_argument("--use-gpu", action="store_true", dest="use_gpu",
+                    help="Use GPU acceleration with cuDF (requires CUDA + cuDF)")
 
     # ---- 基于预打分文件流程 ----
     p3 = subparsers.add_parser("query", help="Query single variant score")
