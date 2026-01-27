@@ -111,7 +111,25 @@ class ClinVarFilter:
                 fout.write(line)
                 kept += 1
 
-        logger.info(f"Filtered: {kept}/{total} records kept")
+        # 统计各分类数量
+        counts = {"Pathogenic": 0, "Likely_pathogenic": 0, "Benign": 0, "Likely_benign": 0}
+        with gzip.open(output_vcf, "rt") as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                info = ClinVarFilter._parse_info(line.split("\t")[7])
+                clin_sig = info.get("CLNSIG", "")
+                if clin_sig in counts:
+                    counts[clin_sig] += 1
+
+        logger.info(f"ClinVar Filtering Summary:")
+        logger.info(f"  Input: {total} records")
+        logger.info(f"  Output: {kept} records")
+        logger.info(f"  Pathogenic (P): {counts['Pathogenic']}")
+        logger.info(f"  Likely_pathogenic (LP): {counts['Likely_pathogenic']}")
+        logger.info(f"  Benign (B): {counts['Benign']}")
+        logger.info(f"  Likely_benign (LB): {counts['Likely_benign']}")
+
         return kept
 
     @staticmethod
