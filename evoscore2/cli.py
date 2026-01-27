@@ -225,17 +225,19 @@ def _to_vcf_polars(args, column_mapping):
     logger.info(f"Converting {len(df)} records (Polars)...")
 
     # 向量化生成 VCF 行（避免 Python 循环）
-    vcf_lines = df.select([
-        pl.col("CHROM").cast(pl.Utf8),
-        pl.lit("\t"),
-        pl.col("POS").cast(pl.Utf8),
-        pl.lit("\t.\t"),
-        pl.col("REF").cast(pl.Utf8),
-        pl.lit("\t"),
-        pl.col("ALT").cast(pl.Utf8),
-        pl.lit("\t.\t.\tEVOScore="),
-        pl.col("score").round(4).cast(pl.Utf8),
-    ]).select(pl.concat_str(pl.all()).alias("line"))
+    vcf_lines = df.select(
+        pl.concat_str([
+            pl.col("CHROM").cast(pl.Utf8),
+            pl.lit("\t"),
+            pl.col("POS").cast(pl.Utf8),
+            pl.lit("\t.\t"),
+            pl.col("REF").cast(pl.Utf8),
+            pl.lit("\t"),
+            pl.col("ALT").cast(pl.Utf8),
+            pl.lit("\t.\t.\tEVOScore="),
+            pl.col("score").round(4).cast(pl.Utf8),
+        ]).alias("line")
+    )
 
     # 写入文件
     open_func = gzip.open if args.output.endswith(".gz") else open
