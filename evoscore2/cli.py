@@ -1,13 +1,13 @@
 """
 EVOScore-2 CLI
 
-Usage:
-    evoscore2 score-all --genome <path> --gff <path> --transcript <id> --output <path>
+## 模型打分流程:
+    evoscore2 score-all --genome <path> --gff <path> --output <path>
     evoscore2 to-vcf --scores <path> --output <path>
-    evoscore2 filter-clinvar --input <path> --output <path> [--min-stars <int>]
-    evoscore2 split-clinvar --input <path> --scores <path> --output <path> [--test-size <float>]
-    evoscore2 calibrate --clinvar <path> --scores <path> --output <path> [--specificity <float>]
-    evoscore2 benchmark --clinvar <path> --scores <path> --threshold <float> --output <path>
+
+## 基于预打分文件流程 (hg38_VESM_3B_scores.parquet.gzip):
+    evoscore2 query --scores <path> --chrom <str> --pos <int> --ref <str> --alt <str>
+    evoscore2 annotate --scores <path> --input <vcf> --output <vcf>
 """
 
 import argparse
@@ -23,8 +23,10 @@ def setup_logger(debug: bool = False):
     logger.add(sys.stderr, level=level, format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}")
 
 
+# ==================== 模型打分流程 ====================
+
 def cmd_score_all(args):
-    """对所有位点进行 ESM-2 评分，输出 Parquet (带基因组坐标)"""
+    """对所有位点进行 ESM-2 评分，输出 Parquet"""
     import pandas as pd
     from .model import EVOScoreModel
     from .vcf_generator import GenomeData, VCFGenerator
@@ -47,12 +49,11 @@ def cmd_score_all(args):
             protein_id=args.protein,
             show_progress=not args.quiet,
         )
-        # 保存为 Parquet
         df = generator.records_to_dataframe(records)
         df.to_parquet(args.output, index=False)
         logger.info(f"Saved {len(records)} records to {args.output}")
     else:
-        # 全量转录本：分批处理，支持断点续传
+        # 全量转录本
         generator.generate_all_to_parquet(
             output_path=args.output,
             protein_id=args.protein,
@@ -63,50 +64,119 @@ def cmd_score_all(args):
 
 
 def cmd_to_vcf(args):
-    """将 Parquet 转换为 VCF (仅格式转换，坐标已在 score-all 时生成)"""
+    """Parquet 转 VCF"""
+    import pandas as pd
     from .vcf_generator import VCFGenerator
 
     df = pd.read_parquet(args.scores)
-
     generator = VCFGenerator(None, None)
     records = generator.dataframe_to_records(df)
     generator.save_vcf(records, args.output)
-
     logger.info(f"Converted {len(records)} records to VCF: {args.output}")
 
+
+# ==================== 基于预打分文件流程 ====================
+
+def cmd_query(args):
+    """查询单个位点分数"""
+    import pandas as pd
+
+    if args.scores.endswith(".parquet"):
+        df = pd.read_parquet(args.scores)
+    else:
+        df = pd.read_csv(args.scores, sep="\t")
+
+    # 精确匹配
+    mask = (
+        (df["CHROM"].astype(str) == str(args.chrom)) &
+        (df["POS"] == args.pos) &
+        (df["REF"].astype(str) == str(args.ref)) &
+        (df["ALT"].astype(str) == str(args.alt))
+    )
+
+    results = df[mask]
+    if len(results) > 0:
+        for _, row in results.iterrows():
+            print(f"CHROM: {row['CHROM']}")
+            print(f"POS: {row['POS']}")
+            print(f"REF: {row['REF']}")
+            print(f"ALT: {row['ALT']}")
+            print(f"score: {row['score']}")
+    else:
+        print("No match found")
+
+
+def cmd_annotate(args):
+    """VCF 批量注释"""
+    import pandas as pd
+    import pysam
+
+    # 加载分数文件
+    if args.scores.endswith(".parquet"):
+        scores_df = pd.read_parquet(args.scores)
+    else:
+        scores_df = pd.read_csv(args.scores, sep="\t")
+
+    # 构建查询索引
+    scores_dict = {}
+    for _, row in scores_df.iterrows():
+        key = (str(row["CHROM"]), int(row["POS"]), str(row["REF"]), str(row["ALT"]))
+        scores_dict[key] = row["score"]
+
+    # 读取并注释 VCF
+    with pysam.VariantFile(args.input, "r") as vcf_in:
+        # 添加 INFO 字段
+        vcf_in.header.add_line(
+            '##INFO=<ID=EVOScore,Number=1,Type=Float,Description="ESM-2 based pathogenicity score">'
+        )
+
+        vcf_out = pysam.VariantFile(args.output, "w", header=vcf_in.header)
+
+        for record in vcf_in:
+            for alt in record.alts:
+                key = (str(record.chrom), record.pos, str(record.ref), str(alt))
+                if key in scores_dict:
+                    record.info["EVOScore"] = scores_dict[key]
+            vcf_out.write(record)
+
+    logger.info(f"Annotated VCF saved to {args.output}")
+
+
+# ==================== ClinVar 流程 ====================
 
 def cmd_filter_clinvar(args):
     """清洗 ClinVar"""
     from .clinvar_benchmark import ClinVarFilter
 
-    kept = ClinVarFilter.filter_vcf(
+    ClinVarFilter.filter_vcf(
         input_vcf=args.input,
         output_vcf=args.output,
         min_stars=args.min_stars,
     )
-    logger.info(f"Filtered ClinVar: {kept} records saved to {args.output}")
+    logger.info(f"ClinVar filtering complete")
 
 
 def cmd_split_clinvar(args):
     """拆分 ClinVar 数据集"""
     from .clinvar_benchmark import ClinVarFilter, ClinVarSplitter
 
-    # 加载过滤后的数据
     records = ClinVarFilter.load_filtered_vcf(args.input)
 
     # 加载分数
-    scores_df = pd.read_csv(args.scores, sep="\t")
+    if args.scores.endswith(".parquet"):
+        scores_df = pd.read_parquet(args.scores)
+    else:
+        scores_df = pd.read_csv(args.scores, sep="\t")
+
     scores_dict = {
-        (row["CHROM"], row["POS"], row["REF"], row["ALT"]): row["score"]
+        (str(row["CHROM"]), int(row["POS"]), str(row["REF"]), str(row["ALT"])): row["score"]
         for _, row in scores_df.iterrows()
     }
 
-    # 分层拆分
     train_records, test_records, X_train, X_test = ClinVarSplitter.stratified_split(
         records, scores_dict, test_size=args.test_size
     )
 
-    # 保存拆分结果
     os.makedirs(args.output, exist_ok=True)
 
     train_df = pd.DataFrame([
@@ -128,31 +198,22 @@ def cmd_split_clinvar(args):
     test_df.to_csv(f"{args.output}/test.csv", index=False)
 
     logger.info(f"Split: Train={len(train_records)}, Test={len(test_records)}")
-    logger.info(f"Saved to {args.output}/train.csv and {args.output}/test.csv")
 
 
 def cmd_calibrate(args):
     """计算阈值"""
-    from .clinvar_benchmark import ClinVarFilter, ThresholdCalibrator
+    from .clinvar_benchmark import ThresholdCalibrator
     import json
 
-    # 加载训练集
     train_df = pd.read_csv(args.input)
-
     X_train = train_df["score"].values
     y_train = (train_df["CLNSIG"].isin(["Pathogenic", "Likely_pathogenic"])).astype(int).values
 
-    # 校准阈值
     threshold, metrics = ThresholdCalibrator.calibrate_by_specificity(
         X_train, y_train, target_specificity=args.specificity
     )
 
-    # 保存结果
-    result = {
-        "threshold": threshold,
-        "specificity": args.specificity,
-        **metrics,
-    }
+    result = {"threshold": threshold, "specificity": args.specificity, **metrics}
     with open(args.output, "w") as f:
         json.dump(result, f, indent=2)
 
@@ -163,102 +224,100 @@ def cmd_calibrate(args):
 def cmd_benchmark(args):
     """Benchmark 评估"""
     from .clinvar_benchmark import BenchmarkEvaluator
-    from .clinvar_benchmark import ClinVarFilter
     import json
 
-    # 加载测试集
     test_df = pd.read_csv(args.input)
-
     X_test = test_df["score"].values
     y_test = (test_df["CLNSIG"].isin(["Pathogenic", "Likely_pathogenic"])).astype(int).values
 
-    # 评估
     metrics = BenchmarkEvaluator.evaluate(X_test, y_test, args.threshold)
 
-    # 保存结果
-    result = {
-        "threshold": args.threshold,
-        **metrics,
-    }
+    result = {"threshold": args.threshold, **metrics}
     with open(args.output, "w") as f:
         json.dump(result, f, indent=2)
 
     logger.info(f"AUC: {metrics['auc']:.4f}")
     logger.info(f"Sensitivity: {metrics['sensitivity']:.4f}")
     logger.info(f"Specificity: {metrics['specificity']:.4f}")
-    logger.info(f"Saved to {args.output}")
 
 
 def main():
     import pandas as pd
 
     parser = argparse.ArgumentParser(
-        description="EVOScore-2: ESM-2 based protein mutation scoring pipeline",
+        description="EVOScore-2: ESM-2 based protein mutation scoring",
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
-
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
-    # 1. score-all: 对所有位点评分，输出 Parquet
-    p1 = subparsers.add_parser("score-all", help="Score all sites, output Parquet")
+    # ---- 模型打分流程 ----
+    p1 = subparsers.add_parser("score-all", help="Score all sites with ESM-2, output Parquet")
     p1.add_argument("--genome", required=True, help="Reference genome FASTA")
     p1.add_argument("--gff", required=True, help="GFF3 annotation")
-    p1.add_argument("--transcript", help="Transcript ID (optional, score all if not specified)")
+    p1.add_argument("--transcript", help="Transcript ID (optional)")
     p1.add_argument("--protein", help="Protein ID (optional)")
     p1.add_argument("--output", required=True, help="Output Parquet path")
-    p1.add_argument("--model-path", help="Local model path (if not specified, download from Hugging Face)")
+    p1.add_argument("--model-path", help="Local model path")
     p1.add_argument("--device", default=None, help="Device (cuda/cpu)")
     p1.add_argument("--quiet", action="store_true", help="Suppress progress bar")
 
-    # 2. to-vcf: Parquet 转 VCF
     p2 = subparsers.add_parser("to-vcf", help="Convert Parquet to VCF")
     p2.add_argument("--scores", required=True, help="Input Parquet file")
     p2.add_argument("--output", required=True, help="Output VCF path")
 
-    # 3. filter-clinvar: 清洗 ClinVar
-    p3 = subparsers.add_parser("filter-clinvar", help="Filter ClinVar VCF")
-    p3.add_argument("--input", required=True, help="Input ClinVar VCF")
-    p3.add_argument("--output", required=True, help="Output filtered VCF")
-    p3.add_argument("--min-stars", type=int, default=1, help="Minimum stars (default: 1)")
+    # ---- 基于预打分文件流程 ----
+    p3 = subparsers.add_parser("query", help="Query single variant score")
+    p3.add_argument("--scores", required=True, help="Scores Parquet/CSV")
+    p3.add_argument("--chrom", required=True, help="Chromosome")
+    p3.add_argument("--pos", required=True, type=int, help="Position")
+    p3.add_argument("--ref", required=True, help="Reference allele")
+    p3.add_argument("--alt", required=True, help="Alternative allele")
 
-    # 4. split-clinvar: 拆分 ClinVar
-    p4 = subparsers.add_parser("split-clinvar", help="Stratified split ClinVar")
-    p4.add_argument("--input", required=True, help="Filtered ClinVar VCF")
+    p4 = subparsers.add_parser("annotate", help="Annotate VCF with EVOScore")
     p4.add_argument("--scores", required=True, help="Scores Parquet/CSV")
-    p4.add_argument("--output", required=True, help="Output directory")
-    p4.add_argument("--test-size", type=float, default=0.8, help="Test proportion (default: 0.8)")
+    p4.add_argument("--input", required=True, help="Input VCF")
+    p4.add_argument("--output", required=True, help="Output VCF")
 
-    # 5. calibrate: 计算阈值
-    p5 = subparsers.add_parser("calibrate", help="Calibrate threshold from training set")
-    p5.add_argument("--input", required=True, help="Training set CSV")
-    p5.add_argument("--scores", help="Scores CSV (if not in input)")
-    p5.add_argument("--output", required=True, help="Output JSON")
-    p5.add_argument("--specificity", type=float, default=0.95, help="Target specificity (default: 0.95)")
+    # ---- ClinVar 流程 ----
+    p5 = subparsers.add_parser("filter-clinvar", help="Filter ClinVar VCF")
+    p5.add_argument("--input", required=True, help="Input ClinVar VCF")
+    p5.add_argument("--output", required=True, help="Output filtered VCF")
+    p5.add_argument("--min-stars", type=int, default=1, help="Minimum stars")
 
-    # 6. benchmark: 评估
-    p6 = subparsers.add_parser("benchmark", help="Benchmark on test set")
-    p6.add_argument("--input", required=True, help="Test set CSV")
-    p6.add_argument("--threshold", type=float, required=True, help="Decision threshold")
-    p6.add_argument("--output", required=True, help="Output JSON")
+    p6 = subparsers.add_parser("split-clinvar", help="Split ClinVar dataset")
+    p6.add_argument("--input", required=True, help="Filtered ClinVar VCF")
+    p6.add_argument("--scores", required=True, help="Scores Parquet/CSV")
+    p6.add_argument("--output", required=True, help="Output directory")
+    p6.add_argument("--test-size", type=float, default=0.8, help="Test proportion")
+
+    p7 = subparsers.add_parser("calibrate", help="Calibrate threshold")
+    p7.add_argument("--input", required=True, help="Training set CSV")
+    p7.add_argument("--output", required=True, help="Output JSON")
+    p7.add_argument("--specificity", type=float, default=0.95, help="Target specificity")
+
+    p8 = subparsers.add_parser("benchmark", help="Benchmark on test set")
+    p8.add_argument("--input", required=True, help="Test set CSV")
+    p8.add_argument("--threshold", type=float, required=True, help="Decision threshold")
+    p8.add_argument("--output", required=True, help="Output JSON")
 
     args = parser.parse_args()
-
     setup_logger(args.debug)
 
-    if args.command == "score-all":
-        cmd_score_all(args)
-    elif args.command == "to-vcf":
-        cmd_to_vcf(args)
-    elif args.command == "filter-clinvar":
-        cmd_filter_clinvar(args)
-    elif args.command == "split-clinvar":
-        cmd_split_clinvar(args)
-    elif args.command == "calibrate":
-        cmd_calibrate(args)
-    elif args.command == "benchmark":
-        cmd_benchmark(args)
+    commands = {
+        "score-all": cmd_score_all,
+        "to-vcf": cmd_to_vcf,
+        "query": cmd_query,
+        "annotate": cmd_annotate,
+        "filter-clinvar": cmd_filter_clinvar,
+        "split-clinvar": cmd_split_clinvar,
+        "calibrate": cmd_calibrate,
+        "benchmark": cmd_benchmark,
+    }
+
+    if args.command in commands:
+        commands[args.command](args)
     else:
         parser.print_help()
 

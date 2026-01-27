@@ -2,90 +2,44 @@
 
 MIT License
 
-基于 ESM-2 (esm2_t33_650M_UR50D) 的蛋白质突变评分。
-
-## 工作流
-
-```
-Genome + GFF3 → [score-all] → Parquet (含基因组坐标) → [to-vcf] → VCF.gz
-                                                              ↓
-ClinVar VCF → [filter-clinvar] → [split-clinvar] → train.csv / test.csv
-                                                               ↓
-                                          [calibrate] → threshold.json
-                                                               ↓
-                                          [benchmark] → benchmark.json
-```
+基于 ESM-2 的蛋白质突变评分与后处理工具。
 
 ## 命令
 
-### 1. 全基因组突变评分 → Parquet
+### 模型打分流程 (从基因组生成)
 
 ```bash
-# 使用本地预下载的模型
-evoscore2 score-all \
-    --genome hg38.fa \
-    --gff MANE.GRCh38.v1.0.gff3.gz \
-    --model-path ./esm2_t33_650M_UR50D \
-    --output scores.parquet
+# 1. 全基因组突变评分 → Parquet
+evoscore2 score-all --genome hg38.fa --gff annotation.gff3 --output scores.parquet
 
-# 或从 Hugging Face Hub 自动下载
-evoscore2 score-all \
-    --genome hg38.fa \
-    --gff MANE.GRCh38.v1.0.gff3.gz \
-    --output scores.parquet
+# 2. Parquet 转 VCF
+evoscore2 to-vcf --scores scores.parquet --output scores.vcf.gz
 ```
 
-**预下载模型（推荐离线使用）:**
+### 基于预打分文件流程 (hg38_VESM_3B_scores.parquet.gzip)
+
 ```bash
-git lfs install
-git clone https://huggingface.co/facebook/esm2_t33_650M_UR50D ./esm2_t33_650M_UR50D
+# 查询单个位点分数
+evoscore2 query --scores hg38_VESM_3B_scores.parquet.gzip --chrom 17 --pos 43044295 --ref A --alt G
+
+# VCF 批量注释
+evoscore2 annotate --scores hg38_VESM_3B_scores.parquet.gzip --input variants.vcf --output annotated.vcf
 ```
 
-输出 Parquet 包含：`CHROM, POS, REF, ALT, score, TranscriptID, ProteinID, ProteinPos, RefAA, AltAA`
-
-### 2. Parquet 转 VCF
+### ClinVar 基准测试流程
 
 ```bash
-evoscore2 to-vcf \
-    --scores scores.parquet \
-    --output scores.vcf.gz
-```
+# 1. 清洗 ClinVar
+evoscore2 filter-clinvar --input clinvar.vcf.gz --output clinvar_filtered.vcf.gz
 
-### 3. 清洗 ClinVar
+# 2. 拆分数据集 (2:8)
+evoscore2 split-clinvar --input clinvar_filtered.vcf.gz --scores scores.parquet --output split_results
 
-```bash
-evoscore2 filter-clinvar \
-    --input clinvar.vcf.gz \
-    --output clinvar_filtered.vcf.gz \
-    --min-stars 1
-```
+# 3. 计算阈值 (训练集)
+evoscore2 calibrate --input split_results/train.csv --output threshold.json --specificity 0.95
 
-### 4. 拆分 ClinVar 数据集
-
-```bash
-evoscore2 split-clinvar \
-    --input clinvar_filtered.vcf.gz \
-    --scores scores.parquet \
-    --output split_results \
-    --test-size 0.8
-```
-
-### 5. 计算阈值 (训练集)
-
-```bash
-evoscore2 calibrate \
-    --input split_results/train.csv \
-    --output threshold.json \
-    --specificity 0.95
-```
-
-### 6. Benchmark (测试集)
-
-```bash
-evoscore2 benchmark \
-    --input split_results/test.csv \
-    --threshold -4.5 \
-    --output benchmark.json
+# 4. Benchmark (测试集)
+evoscore2 benchmark --input split_results/test.csv --threshold -4.5 --output benchmark.json
 ```
 
 ## 安装
