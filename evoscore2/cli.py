@@ -193,22 +193,22 @@ def _to_vcf_cpu(args, column_mapping, is_gzip_parquet):
 
 
 def _to_vcf_polars(args, column_mapping):
-    """Polars 高性能版本的 Parquet 转 VCF（向量化操作）"""
+    """Polars 高性能版本的 Parquet 转 VCF（流式分块处理）"""
     import gzip
     import polars as pl
 
     logger.info("Using Polars backend (high performance)...")
 
-    # 读取 parquet（Polars 原生支持，自动处理内部压缩）
-    df = pl.read_parquet(args.scores)
-    col_names = df.columns
+    # 使用 scan_parquet 懒加载，不立即读入内存
+    lf = pl.scan_parquet(args.scores)
+    col_names = lf.collect_schema().names()
 
     # 检查必需列
     required_cols = ["CHROM", "POS", "REF", "ALT"]
     if not all(c in col_names for c in required_cols):
         raise ValueError(f"Missing required columns. Found: {col_names}")
 
-    # 找到 score 列并重命名
+    # 找到 score 列
     score_col = None
     for old_col in column_mapping.keys():
         if old_col in col_names:
@@ -219,29 +219,20 @@ def _to_vcf_polars(args, column_mapping):
     if score_col is None:
         raise ValueError(f"No score column found. Available: {col_names}")
 
+    # 重命名 score 列
     if score_col != "score":
-        df = df.rename({score_col: "score"})
+        lf = lf.rename({score_col: "score"})
 
-    logger.info(f"Converting {len(df)} records (Polars)...")
-
-    # 向量化生成 VCF 行（避免 Python 循环）
-    vcf_lines = df.select(
-        pl.concat_str([
-            pl.col("CHROM").cast(pl.Utf8),
-            pl.lit("\t"),
-            pl.col("POS").cast(pl.Utf8),
-            pl.lit("\t.\t"),
-            pl.col("REF").cast(pl.Utf8),
-            pl.lit("\t"),
-            pl.col("ALT").cast(pl.Utf8),
-            pl.lit("\t.\t.\tEVOScore="),
-            pl.col("score").round(4).cast(pl.Utf8),
-        ]).alias("line")
-    )
+    # 获取总行数（用于进度显示）
+    total_rows = pl.scan_parquet(args.scores).select(pl.len()).collect().item()
+    logger.info(f"Converting {total_rows} records (Polars, streaming)...")
 
     # 写入文件
     open_func = gzip.open if args.output.endswith(".gz") else open
     mode = "wt" if args.output.endswith(".gz") else "w"
+
+    # 分块大小
+    chunk_size = 2_000_000  # 每次处理 200 万行
 
     with open_func(args.output, mode) as f:
         # 写入 VCF 头
@@ -249,10 +240,33 @@ def _to_vcf_polars(args, column_mapping):
         f.write('##INFO=<ID=EVOScore,Number=1,Type=Float,Description="ESM-2 based pathogenicity score">\n')
         f.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
 
-        # 批量写入数据行
-        lines = vcf_lines["line"].to_list()
-        f.write("\n".join(lines))
-        f.write("\n")
+        # 分块处理
+        for offset in range(0, total_rows, chunk_size):
+            # 读取一块数据
+            chunk_df = lf.slice(offset, chunk_size).collect()
+
+            # 向量化生成 VCF 行
+            vcf_lines = chunk_df.select(
+                pl.concat_str([
+                    pl.col("CHROM").cast(pl.Utf8),
+                    pl.lit("\t"),
+                    pl.col("POS").cast(pl.Utf8),
+                    pl.lit("\t.\t"),
+                    pl.col("REF").cast(pl.Utf8),
+                    pl.lit("\t"),
+                    pl.col("ALT").cast(pl.Utf8),
+                    pl.lit("\t.\t.\tEVOScore="),
+                    pl.col("score").round(4).cast(pl.Utf8),
+                ]).alias("line")
+            )
+
+            # 写入文件
+            for line in vcf_lines["line"]:
+                f.write(line)
+                f.write("\n")
+
+            processed = min(offset + chunk_size, total_rows)
+            logger.info(f"Progress: {processed}/{total_rows} ({100*processed//total_rows}%)")
 
     logger.info(f"Converted to VCF: {args.output}")
 
