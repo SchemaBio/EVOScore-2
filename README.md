@@ -1,8 +1,8 @@
 # EVOScore-2
 
-MIT License - 可自由用于商业用途
+MIT License
 
-基于 ESM-2 (esm2_t33_650M_UR50D) 的蛋白质突变评分工具。
+基于 ESM-2 (esm2_t33_650M_UR50D) 的蛋白质突变评分。
 
 ## 工作流
 

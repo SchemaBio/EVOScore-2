@@ -51,6 +51,9 @@ class ClinVarRecord:
 class ClinVarFilter:
     """ClinVar 数据过滤器"""
 
+    # ClinVar 变异类型
+    MISSENSE = "single_nucleotide_variant"
+
     @staticmethod
     def filter_vcf(
         input_vcf: str,
@@ -58,6 +61,7 @@ class ClinVarFilter:
         min_stars: int = 1,
         include_types: Optional[Set[str]] = None,
         exclude_types: Optional[Set[str]] = None,
+        only_missense: bool = True,
     ) -> int:
         """
         过滤 ClinVar VCF
@@ -66,8 +70,9 @@ class ClinVarFilter:
             input_vcf: 输入 VCF 路径
             output_vcf: 输出 VCF 路径
             min_stars: 最小星级
-            include_types: 只保留的类型 (Pat/Likely_path, Benign/Likely_benign)
-            exclude_types: 排除的类型
+            include_types: 只保留的临床显著性类型 (Pat/Likely_path, Benign/Likely_benign)
+            exclude_types: 排除的临床显著性类型
+            only_missense: 是否只保留 Missense 突变 (默认 True)
 
         Returns:
             保留的记录数
@@ -91,6 +96,7 @@ class ClinVarFilter:
                 info = ClinVarFilter._parse_info(fields[7])
 
                 clin_sig = info.get("CLNSIG", "")
+                clin_vc = info.get("CLNVC", "")  # Variant Type
                 stars = ClinVarFilter._get_stars(info.get("CLNDISDB", ""))
 
                 if stars < min_stars:
@@ -98,6 +104,8 @@ class ClinVarFilter:
                 if clin_sig not in include_types:
                     continue
                 if clin_sig in exclude_types:
+                    continue
+                if only_missense and clin_vc != "single_nucleotide_variant":
                     continue
 
                 fout.write(line)
