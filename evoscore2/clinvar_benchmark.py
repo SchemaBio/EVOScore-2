@@ -5,6 +5,10 @@ ClinVar Benchmark 模块
 """
 
 import gzip
+try:
+    from typing import NoReturn
+except ImportError:
+    from typing_extensions import NoReturn
 from typing import List, Dict, Tuple, Optional, Set
 from dataclasses import dataclass
 from loguru import logger
