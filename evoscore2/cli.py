@@ -643,35 +643,47 @@ def cmd_split_clinvar(args):
 
 def cmd_calibrate(args):
     """计算阈值"""
+    import pandas as pd
     from .clinvar_benchmark import ThresholdCalibrator
     import json
 
     train_df = pd.read_csv(args.input)
-    X_train = train_df["score"].values
+    # 取反分数：ESM-2 分数越负越致病，取反后越高越致病
+    X_train = -train_df["score"].values
     y_train = (train_df["CLNSIG"].isin(["Pathogenic", "Likely_pathogenic"])).astype(int).values
 
     threshold, metrics = ThresholdCalibrator.calibrate_by_specificity(
         X_train, y_train, target_specificity=args.specificity
     )
 
-    result = {"threshold": threshold, "specificity": args.specificity, **metrics}
+    # 保存时将阈值转回原始尺度（取反）
+    result = {
+        "threshold": -threshold,  # 转回原始尺度
+        "threshold_negated": threshold,  # 取反后的阈值（用于内部计算）
+        "specificity": args.specificity,
+        **metrics
+    }
     with open(args.output, "w") as f:
         json.dump(result, f, indent=2)
 
-    logger.info(f"Calibrated threshold: {threshold:.4f}")
+    logger.info(f"Calibrated threshold: {-threshold:.4f} (sensitivity: {metrics.get('sensitivity', 'N/A')})")
     logger.info(f"Saved to {args.output}")
 
 
 def cmd_benchmark(args):
     """Benchmark 评估"""
+    import pandas as pd
     from .clinvar_benchmark import BenchmarkEvaluator
     import json
 
     test_df = pd.read_csv(args.input)
-    X_test = test_df["score"].values
+    # 取反分数：与 calibrate 保持一致
+    X_test = -test_df["score"].values
     y_test = (test_df["CLNSIG"].isin(["Pathogenic", "Likely_pathogenic"])).astype(int).values
 
-    metrics = BenchmarkEvaluator.evaluate(X_test, y_test, args.threshold)
+    # 阈值也需要取反（因为输入的是原始尺度的阈值）
+    threshold_negated = -args.threshold
+    metrics = BenchmarkEvaluator.evaluate(X_test, y_test, threshold_negated)
 
     result = {"threshold": args.threshold, **metrics}
     with open(args.output, "w") as f:
