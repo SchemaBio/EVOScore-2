@@ -66,13 +66,23 @@ def cmd_score_all(args):
 def cmd_to_vcf(args):
     """Parquet 转 VCF"""
     import pandas as pd
-    from .vcf_generator import VCFGenerator
     import gzip
 
     # 处理 .parquet.gzip 压缩文件
-    if args.scores.endswith(".parquet.gzip") or args.scores.endswith(".gz"):
-        with gzip.open(args.scores, 'rb') as f:
-            df = pd.read_parquet(f)
+    if args.scores.endswith(".parquet.gzip") or args.scores.endswith(".parquet.gz"):
+        # 尝试 gzip 方式，不行就尝试普通 parquet
+        try:
+            with gzip.open(args.scores, 'rb') as f:
+                df = pd.read_parquet(f)
+        except gzip.BadGzipFile:
+            # 不是真正的 gzip 文件，作为普通 parquet 读取
+            df = pd.read_parquet(args.scores)
+    elif args.scores.endswith(".gz"):
+        try:
+            with gzip.open(args.scores, 'rb') as f:
+                df = pd.read_parquet(f)
+        except gzip.BadGzipFile:
+            df = pd.read_parquet(args.scores)
     else:
         df = pd.read_parquet(args.scores)
 
@@ -108,10 +118,19 @@ def _load_scores(args):
     import gzip
 
     if args.scores.endswith(".parquet.gzip") or args.scores.endswith(".parquet.gz"):
-        with gzip.open(args.scores, 'rb') as f:
-            df = pd.read_parquet(f)
+        try:
+            with gzip.open(args.scores, 'rb') as f:
+                df = pd.read_parquet(f)
+        except gzip.BadGzipFile:
+            df = pd.read_parquet(args.scores)
     elif args.scores.endswith(".parquet"):
         df = pd.read_parquet(args.scores)
+    elif args.scores.endswith(".gz"):
+        try:
+            with gzip.open(args.scores, 'rb') as f:
+                df = pd.read_parquet(f)
+        except gzip.BadGzipFile:
+            df = pd.read_csv(args.scores, sep="\t")
     else:
         df = pd.read_csv(args.scores, sep="\t")
 
