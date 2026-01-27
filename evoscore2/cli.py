@@ -64,29 +64,12 @@ def cmd_score_all(args):
 
 
 def cmd_to_vcf(args):
-    """Parquet 转 VCF"""
+    """Parquet 转 VCF（流式处理，大文件友好）"""
     import pandas as pd
     import gzip
+    from .vcf_generator import VCFGenerator
 
-    # 处理 .parquet.gzip 压缩文件
-    if args.scores.endswith(".parquet.gzip") or args.scores.endswith(".parquet.gz"):
-        # 尝试 gzip 方式，不行就尝试普通 parquet
-        try:
-            with gzip.open(args.scores, 'rb') as f:
-                df = pd.read_parquet(f)
-        except gzip.BadGzipFile:
-            # 不是真正的 gzip 文件，作为普通 parquet 读取
-            df = pd.read_parquet(args.scores)
-    elif args.scores.endswith(".gz"):
-        try:
-            with gzip.open(args.scores, 'rb') as f:
-                df = pd.read_parquet(f)
-        except gzip.BadGzipFile:
-            df = pd.read_parquet(args.scores)
-    else:
-        df = pd.read_parquet(args.scores)
-
-    # 标准化列名 (处理 "VESM (3B)" 这种特殊列名)
+    # 标准化列名映射
     column_mapping = {
         "VESM (3B)": "score",
         "VESM(3B)": "score",
@@ -94,20 +77,98 @@ def cmd_to_vcf(args):
         "VESM": "score",
         "EVOScore": "score",
     }
-    for old_col, new_col in column_mapping.items():
-        if old_col in df.columns:
-            df = df.rename(columns={old_col: new_col})
 
-    # 确保必需列存在
-    required_cols = ["CHROM", "POS", "REF", "ALT", "score"]
-    for col in required_cols:
-        if col not in df.columns:
-            raise ValueError(f"Missing required column: {col}")
+    # 确定文件类型并设置读取方式
+    is_gzip_parquet = args.scores.endswith(".parquet.gzip") or args.scores.endswith(".parquet.gz")
+    is_parquet = args.scores.endswith(".parquet") or is_gzip_parquet
 
-    generator = VCFGenerator(None, None)
-    records = generator.dataframe_to_records(df)
-    generator.save_vcf(records, args.output)
-    logger.info(f"Converted {len(records)} records to VCF: {args.output}")
+    if is_parquet:
+        from pyarrow.parquet import ParquetFile
+        import pyarrow as pa
+
+        # 尝试 gzip 方式
+        if is_gzip_parquet:
+            try:
+                with gzip.open(args.scores, 'rb') as f:
+                    pf = ParquetFile(f)
+            except gzip.BadGzipFile:
+                pf = ParquetFile(args.scores)
+        else:
+            pf = ParquetFile(args.scores)
+
+        # 获取列名并检查必需列
+        schema = pf.schema_arrow
+        col_names = [s.name for s in schema]
+        required_cols = ["CHROM", "POS", "REF", "ALT"]
+
+        # 检查是否有 score 列（可能有不同名称）
+        score_col = None
+        for old_col, new_col in column_mapping.items():
+            if old_col in col_names:
+                score_col = old_col
+                break
+        if score_col is None and "score" in col_names:
+            score_col = "score"
+
+        if not all(c in col_names for c in required_cols):
+            raise ValueError(f"Missing required columns. Found: {col_names}")
+        if score_col is None:
+            raise ValueError(f"No score column found. Available: {col_names}")
+
+        logger.info(f"Converting {pf.metadata.num_rows} records...")
+
+        # 初始化 VCF 生成器
+        generator = VCFGenerator(None, None)
+
+        # 打开输出 VCF（支持 .gz 压缩）
+        open_func = gzip.open if args.output.endswith(".gz") else open
+        mode = "wt" if args.output.endswith(".gz") else "w"
+
+        # 先读取第一块获取列信息，写入表头
+        first_batch = pf.read_row_group(0)
+        first_df = first_batch.to_pandas()
+        for old_col, new_col in column_mapping.items():
+            if old_col in first_df.columns:
+                first_df = first_df.rename(columns={old_col: new_col})
+
+        records = generator.dataframe_to_records(first_df)
+
+        with open_func(args.output, mode) as f:
+            generator.save_vcf_to_file(records, f)
+
+        # 分块处理剩余数据
+        n_rows = pf.metadata.num_rows
+        batch_size = pf.metadata.row_group(0).num_rows
+        total_groups = pf.metadata.num_row_groups
+
+        for i in range(1, total_groups):
+            batch = pf.read_row_group(i)
+            df = batch.to_pandas()
+            for old_col, new_col in column_mapping.items():
+                if old_col in df.columns:
+                    df = df.rename(columns={old_col: new_col})
+            records = generator.dataframe_to_records(df)
+            with open_func(args.output, "at" if args.output.endswith(".gz") else "a") as f:
+                generator.save_vcf_to_file(records, f, append=True)
+
+        logger.info(f"Converted to VCF: {args.output}")
+
+    else:
+        # CSV 文件（全量读取，小文件适用）
+        df = pd.read_csv(args.scores, sep="\t")
+        for old_col, new_col in column_mapping.items():
+            if old_col in df.columns:
+                df = df.rename(columns={old_col: new_col})
+
+        required_cols = ["CHROM", "POS", "REF", "ALT", "score"]
+        for col in required_cols:
+            if col not in df.columns:
+                raise ValueError(f"Missing required column: {col}")
+
+        generator = VCFGenerator(None, None)
+        records = generator.dataframe_to_records(df)
+        generator.save_vcf(records, args.output)
+        logger.info(f"Converted {len(records)} records to VCF: {args.output}")
 
 
 # ==================== 基于预打分文件流程 ====================

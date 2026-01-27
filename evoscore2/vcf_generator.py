@@ -598,3 +598,31 @@ class VCFGenerator:
             )
             records.append(record)
         return records
+
+    @staticmethod
+    def save_vcf_to_file(
+        records: List[VCFRecord],
+        file_handle,
+        append: bool = False,
+    ):
+        """
+        将 VCF 记录写入已打开的文件句柄（流式/分块写入友好）
+
+        Args:
+            records: VCF 记录列表
+            file_handle: 已打开的文件句柄
+            append: 是否为追加模式（追加时跳过表头）
+        """
+        # 写入表头（仅首次）
+        if not append:
+            file_handle.write("##fileformat=VCFv4.2\n")
+            file_handle.write('##INFO=<ID=EVOScore,Number=1,Type=Float,Description="ESM-2 based pathogenicity score. Log-Likelihood Ratio. Negative values indicate pathogenicity.">\n')
+            file_handle.write('##INFO=<ID=ProteinID,Number=1,Type=String,Description="Protein identifier">\n')
+            file_handle.write('##INFO=<ID=ProteinPos,Number=1,Type=Integer,Description="Protein position (1-based)">\n')
+            file_handle.write('##INFO=<ID=RefAA,Number=1,Type=String,Description="Reference amino acid">\n')
+            file_handle.write('##INFO=<ID=AltAA,Number=1,Type=String,Description="Alternative amino acid">\n')
+            file_handle.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
+
+        # 写入记录
+        for record in records:
+            file_handle.write(record.to_vcf_line() + "\n")
