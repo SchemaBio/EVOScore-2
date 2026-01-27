@@ -101,7 +101,8 @@ class ClinVarFilter:
 
                 clin_sig = info.get("CLNSIG", "")
                 clin_vc = info.get("CLNVC", "")  # Variant Type
-                stars = ClinVarFilter._get_stars(info.get("CLNDISDB", ""))
+                clnrevstat = info.get("CLNREVSTAT", "")
+                stars = ClinVarFilter._get_stars(clnrevstat)
 
                 if stars < min_stars:
                     continue
@@ -146,14 +147,43 @@ class ClinVarFilter:
                 info[key] = value
         return info
 
+    # ClinVar 星级映射（基于 CLNREVSTAT）
+    STAR_MAPPING: Dict[str, int] = {
+        "criteria_provided,_multiple_submitters": 4,
+        "reviewed_by_expert_panel": 3,
+        "criteria_provided,_conflicting_interpretations": 2,
+        "criteria_provided,_single_submitter": 2,
+        "no_criteria": 1,
+    }
+
     @staticmethod
-    def _get_stars(clndisdb: str) -> int:
-        """提取星级"""
-        if not clndisdb:
+    def _get_stars(clnrevstat: str) -> int:
+        """
+        根据 CLNREVSTAT 计算星级
+
+        星级规则（基于 ClinVar 官方标准）：
+        - 4 stars: criteria provided, multiple submitters (no conflicts)
+        - 3 stars: reviewed by expert panel
+        - 2 stars: criteria provided, conflicting interpretations / single submitter
+        - 1 star: no criteria provided / single submitter
+        """
+        if not clnrevstat:
             return 0
-        try:
-            return int(clndisdb.split(":")[0].split(",")[0].split(";")[0])
-        except (ValueError, IndexError):
+
+        clnrevstat = clnrevstat.lower()
+
+        # 按优先级匹配
+        if "guideline" in clnrevstat or "criteria_provided,_multiple_submitters" in clnrevstat:
+            return 4
+        elif "reviewed_by_expert_panel" in clnrevstat:
+            return 3
+        elif "criteria_provided,_conflicting_interpretations" in clnrevstat:
+            return 2
+        elif "criteria_provided,_single_submitter" in clnrevstat:
+            return 2
+        elif "no_criteria" in clnrevstat or "single_submitter" in clnrevstat:
+            return 1
+        else:
             return 0
 
     @staticmethod
@@ -171,7 +201,11 @@ class ClinVarFilter:
                 info = ClinVarFilter._parse_info(fields[7])
 
                 clin_sig = info.get("CLNSIG", "")
+                clnrevstat = info.get("CLNREVSTAT", "")
                 gene = info.get("GENEINFO", "").split(":")[0] if "GENEINFO" in info else None
+
+                # 根据 CLNREVSTAT 计算星级
+                stars = ClinVarFilter._get_stars(clnrevstat)
 
                 record = ClinVarRecord(
                     chrom=fields[0],
@@ -179,8 +213,8 @@ class ClinVarFilter:
                     ref=fields[3],
                     alt=fields[4],
                     clinical_significance=clin_sig,
-                    review_status=info.get("CLNREVSTAT", ""),
-                    stars=ClinVarFilter._get_stars(info.get("CLNDISDB", "")),
+                    review_status=clnrevstat,
+                    stars=stars,
                     gene=gene,
                 )
                 records.append(record)
