@@ -542,15 +542,11 @@ class VCFGenerator:
             # 写入 Header
             f.write("##fileformat=VCFv4.2\n")
             f.write('##INFO=<ID=EVOScore,Number=1,Type=Float,Description="ESM-2 based pathogenicity score. Log-Likelihood Ratio. Negative values indicate pathogenicity.">\n')
-            f.write('##INFO=<ID=ProteinID,Number=1,Type=String,Description="Protein identifier">\n')
-            f.write('##INFO=<ID=ProteinPos,Number=1,Type=Integer,Description="Protein position (1-based)">\n')
-            f.write('##INFO=<ID=RefAA,Number=1,Type=String,Description="Reference amino acid">\n')
-            f.write('##INFO=<ID=AltAA,Number=1,Type=String,Description="Alternative amino acid">\n')
             f.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
 
             # 写入记录
             for record in records:
-                f.write(record.to_vcf_line() + "\n")
+                f.write(f"{record.chrom}\t{record.pos}\t.\t{record.ref}\t{record.alt}\t.\t.\tEVOScore={record.score:.4f}\n")
 
         logger.info(f"Saved {len(records)} records to {output_path}")
 
@@ -617,12 +613,8 @@ class VCFGenerator:
         if not append:
             file_handle.write("##fileformat=VCFv4.2\n")
             file_handle.write('##INFO=<ID=EVOScore,Number=1,Type=Float,Description="ESM-2 based pathogenicity score. Log-Likelihood Ratio. Negative values indicate pathogenicity.">\n')
-            file_handle.write('##INFO=<ID=ProteinID,Number=1,Type=String,Description="Protein identifier">\n')
-            file_handle.write('##INFO=<ID=ProteinPos,Number=1,Type=Integer,Description="Protein position (1-based)">\n')
-            file_handle.write('##INFO=<ID=RefAA,Number=1,Type=String,Description="Reference amino acid">\n')
-            file_handle.write('##INFO=<ID=AltAA,Number=1,Type=String,Description="Alternative amino acid">\n')
             file_handle.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
 
-        # 写入记录
+        # 写入记录（只保留 EVOScore）
         for record in records:
-            file_handle.write(record.to_vcf_line() + "\n")
+            file_handle.write(f"{record.chrom}\t{record.pos}\t.\t{record.ref}\t{record.alt}\t.\t.\tEVOScore={record.score:.4f}\n")
