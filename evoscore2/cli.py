@@ -419,6 +419,86 @@ def _load_scores(args):
     return df
 
 
+def _load_scores_for_variants(scores_path, query_keys):
+    """
+    高效加载指定变异位点的分数（使用 Polars 流式处理）
+
+    Args:
+        scores_path: 分数文件路径
+        query_keys: 需要查询的位点集合 {(chrom, pos, ref, alt), ...}
+
+    Returns:
+        scores_dict: {(chrom, pos, ref, alt): score, ...}
+    """
+    import polars as pl
+
+    # 标准化列名映射
+    column_mapping = {
+        "VESM (3B)": "score",
+        "VESM(3B)": "score",
+        "VESM_3B": "score",
+        "VESM": "score",
+        "EVOScore": "score",
+    }
+
+    # 使用 Polars 懒加载
+    lf = pl.scan_parquet(scores_path)
+    col_names = lf.collect_schema().names()
+
+    # 找到 score 列
+    score_col = None
+    for old_col in column_mapping.keys():
+        if old_col in col_names:
+            score_col = old_col
+            break
+    if score_col is None and "score" in col_names:
+        score_col = "score"
+
+    if score_col and score_col != "score":
+        lf = lf.rename({score_col: "score"})
+
+    # 构建查询 DataFrame
+    query_data = {
+        "CHROM": [k[0] for k in query_keys],
+        "POS": [k[1] for k in query_keys],
+        "REF": [k[2] for k in query_keys],
+        "ALT": [k[3] for k in query_keys],
+    }
+    query_df = pl.DataFrame(query_data)
+
+    # 分块处理，避免内存溢出
+    chunk_size = 5_000_000
+    total_rows = pl.scan_parquet(scores_path).select(pl.len()).collect().item()
+
+    scores_dict = {}
+
+    for offset in range(0, total_rows, chunk_size):
+        chunk = lf.slice(offset, chunk_size).collect()
+
+        # 确保类型一致
+        chunk = chunk.with_columns([
+            pl.col("CHROM").cast(pl.Utf8),
+            pl.col("REF").cast(pl.Utf8),
+            pl.col("ALT").cast(pl.Utf8),
+        ])
+
+        # 内连接找到匹配的行
+        matched = chunk.join(
+            query_df,
+            on=["CHROM", "POS", "REF", "ALT"],
+            how="inner"
+        )
+
+        # 添加到结果字典
+        for row in matched.iter_rows(named=True):
+            key = (str(row["CHROM"]), int(row["POS"]), str(row["REF"]), str(row["ALT"]))
+            scores_dict[key] = row["score"]
+
+        logger.debug(f"Processed {min(offset + chunk_size, total_rows)}/{total_rows}, found {len(scores_dict)} matches")
+
+    return scores_dict
+
+
 def cmd_query(args):
     """查询单个位点分数"""
     df = _load_scores(args)
@@ -490,18 +570,24 @@ def cmd_filter_clinvar(args):
 
 
 def cmd_split_clinvar(args):
-    """拆分 ClinVar 数据集"""
+    """拆分 ClinVar 数据集（内存优化版）"""
+    import pandas as pd
     from .clinvar_benchmark import ClinVarFilter, ClinVarSplitter
 
     records = ClinVarFilter.load_filtered_vcf(args.input)
+    logger.info(f"Loaded {len(records)} ClinVar records")
 
-    # 加载分数
-    scores_df = _load_scores(args)
+    # 构建需要查询的位点集合
+    query_keys = set()
+    for r in records:
+        query_keys.add((str(r.chrom), int(r.pos), str(r.ref), str(r.alt)))
 
-    scores_dict = {
-        (str(row["CHROM"]), int(row["POS"]), str(row["REF"]), str(row["ALT"])): row["score"]
-        for _, row in scores_df.iterrows()
-    }
+    logger.info(f"Looking up {len(query_keys)} variants in scores file...")
+
+    # 使用 Polars 高效查询（只加载需要的数据）
+    scores_dict = _load_scores_for_variants(args.scores, query_keys)
+
+    logger.info(f"Found {len(scores_dict)} matching scores")
 
     train_records, test_records, X_train, X_test = ClinVarSplitter.stratified_split(
         records, scores_dict, test_size=args.test_size
