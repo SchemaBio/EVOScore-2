@@ -354,6 +354,112 @@ class ThresholdCalibrator:
         logger.info(f"Youden threshold: {threshold:.4f}")
         return threshold, metrics
 
+    @staticmethod
+    def calibrate_three_class(
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        target_specificity: float = 0.95,
+        target_specificity_b: float = 0.95,
+    ) -> Tuple[float, float, Dict]:
+        """
+        三分类阈值校准：P_threshold 和 B_threshold
+
+        使用独立的 ROC 曲线分析：
+        - P 侧（高分区域）：优化 Youden's J，最大化灵敏度
+        - B 侧（低分区域）：基于特异性校准
+
+        Args:
+            X_train: 训练集分数（取反后，越正越致病）
+            y_train: 训练集标签 (1=致病, 0=良性)
+            target_specificity: P 侧目标特异性
+            target_specificity_b: B 侧目标特异性
+
+        Returns:
+            (p_threshold, b_threshold, 校准指标)
+        """
+        # 计算完整 ROC 曲线
+        fpr, tpr, thresholds = roc_curve(y_train, X_train)
+        specificities = 1 - fpr
+
+        # ========== P 侧分析：高特异性的前提下最大化灵敏度 ==========
+        # 策略：在满足目标特异性的高分区域点中，选择灵敏度最高的
+        # 这样可以提高PPV（减少假阳性）
+        median_thr = np.median(X_train)
+        high_thr_mask = thresholds >= median_thr
+        high_thr_indices = np.where(high_thr_mask)[0]
+
+        if len(high_thr_indices) > 0:
+            high_specs = specificities[high_thr_indices]
+            high_tpr = tpr[high_thr_indices]
+
+            # 筛选满足目标特异性的高分区域点
+            p_candidate_mask = high_specs >= target_specificity
+            p_candidate_indices = high_thr_indices[p_candidate_mask]
+
+            if len(p_candidate_indices) > 0:
+                # 在满足特异性的候选点中，选择灵敏度最高的
+                p_idx = p_candidate_indices[np.argmax(tpr[p_candidate_indices])]
+            else:
+                # 如果没有满足特异性的点，选择高分区域中特异性最接近目标的
+                best_idx = np.argmin(np.abs(high_specs - target_specificity))
+                p_idx = high_thr_indices[best_idx]
+        else:
+            # 如果没有高分区域点，用全局满足特异性的点
+            p_idx = np.argmin(np.abs(specificities - target_specificity))
+
+        # ========== B 侧分析：低分区域找目标特异性 ==========
+        # 低分区域：thresholds <= median，预测 B = X < threshold
+        low_thr_mask = thresholds <= median_thr
+        low_thr_indices = np.where(low_thr_mask)[0]
+
+        if len(low_thr_indices) > 0:
+            low_specs = specificities[low_thr_indices]
+            # 在低分区域找最接近目标特异性的点
+            best_idx = np.argmin(np.abs(low_specs - target_specificity_b))
+            b_idx = low_thr_indices[best_idx]
+        else:
+            b_idx = np.argmin(np.abs(specificities - target_specificity_b))
+
+        p_thr_neg = thresholds[p_idx]
+        b_thr_neg = thresholds[b_idx]
+
+        # 转回原始尺度
+        # 原始尺度：P_threshold < B_threshold
+        p_threshold = -p_thr_neg
+        b_threshold = -b_thr_neg
+
+        # 确保 P < B
+        if p_threshold >= b_threshold:
+            p_thr_neg = np.percentile(X_train, 85)
+            b_thr_neg = np.percentile(X_train, 15)
+            p_threshold = -p_thr_neg
+            b_threshold = -b_thr_neg
+            logger.warning(f"Thresholds adjusted: P={p_threshold:.4f}, B={b_threshold:.4f}")
+
+        metrics = {
+            "p_threshold_config": {
+                "method": "max_sens_high_spec",
+                "target_specificity": target_specificity,
+                "actual_specificity": float(1 - fpr[p_idx]),
+                "sensitivity_at_p_threshold": float(tpr[p_idx]),
+            },
+            "b_threshold_config": {
+                "target_specificity": target_specificity_b,
+                "actual_specificity": float(1 - fpr[b_idx]),
+                "sensitivity_at_b_threshold": float(tpr[b_idx]),
+            },
+            "p_threshold": float(p_threshold),
+            "b_threshold": float(b_threshold),
+        }
+
+        logger.info(f"Three-class thresholds (original scale): P={p_threshold:.4f}, B={b_threshold:.4f}")
+        logger.info(f"  P_region (max sens at spec>={target_specificity}): "
+                    f"spec={1-fpr[p_idx]:.4f}, sens={tpr[p_idx]:.4f}")
+        logger.info(f"  B_region (spec>={target_specificity_b}): "
+                    f"spec={1-fpr[b_idx]:.4f}, sens={tpr[b_idx]:.4f}")
+
+        return p_threshold, b_threshold, metrics
+
 
 class BenchmarkEvaluator:
     """基准测试评估器"""
@@ -365,7 +471,7 @@ class BenchmarkEvaluator:
         threshold: float,
     ) -> Dict:
         """
-        在测试集上评估性能
+        在测试集上评估性能（二分类）
 
         Args:
             X_test: 测试集分数
@@ -402,6 +508,144 @@ class BenchmarkEvaluator:
         }
 
         logger.info(f"Benchmark AUC: {roc_auc:.4f}, Sens: {sensitivity:.4f}, Spec: {specificity:.4f}")
+        return results
+
+    @staticmethod
+    def evaluate_three_class(
+        X_test: np.ndarray,
+        y_test: np.ndarray,
+        p_threshold: float,
+        b_threshold: float,
+    ) -> Dict:
+        """
+        在测试集上评估三分类性能（P / B / VUS）
+
+        X_test 已经是取反后的分数（越正越致病）
+        p_threshold 和 b_threshold 是原始尺度的阈值
+
+        分类规则（原始尺度）：
+          - score < P_threshold → P（致病）
+          - score > B_threshold → B（良性）
+          - P_threshold <= score <= B_threshold → VUS
+
+        分类规则（取反后 X_test = -score）：
+          - X_test > -P_threshold → P（因为 -score > -P_threshold 意味着 score < P_threshold）
+          - X_test < -B_threshold → B（因为 -score < -B_threshold 意味着 score > B_threshold）
+
+        Args:
+            X_test: 测试集分数（取反后）
+            y_test: 测试集标签 (1=致病, 0=良性)
+            p_threshold: P 阈值（原始尺度）
+            b_threshold: B 阈值（原始尺度）
+
+        Returns:
+            评估指标字典
+        """
+        # 转换阈值到取反后尺度
+        # 原始尺度: P_threshold < B_threshold (e.g., -8.29 < -3.95)
+        # 取反后: p_thr_neg > b_thr_neg (e.g., 8.29 > 3.95)
+        p_thr_neg = -p_threshold  # e.g., 8.29
+        b_thr_neg = -b_threshold  # e.g., 3.95
+
+        # 三分类预测
+        # 原始尺度分类规则:
+        #   - score < P_threshold → P
+        #   - score > B_threshold → B
+        #   - B_threshold <= score < P_threshold → VUS
+        #
+        # 取反后 (X_test = -score):
+        #   - score < P_threshold → -score > -P_threshold → X_test > p_thr_neg → P
+        #   - score > B_threshold → -score < -B_threshold → X_test < b_thr_neg → B
+        #   - B_threshold <= score < P_threshold → b_thr_neg <= X_test <= p_thr_neg → VUS
+        #
+        # 由于 p_thr_neg > b_thr_neg:
+        #   - P region: X_test > p_thr_neg (8.29)
+        #   - B region: X_test < b_thr_neg (3.95)
+        #   - VUS region: b_thr_neg <= X_test <= p_thr_neg (3.95 to 8.29)
+
+        y_pred = np.full_like(X_test, -1, dtype=int)  # 默认 VUS
+        y_pred[X_test > p_thr_neg] = 1   # P: X_test > -P_threshold
+        y_pred[X_test < b_thr_neg] = 0   # B: X_test < -B_threshold
+
+        # 分别统计
+        # 预测为 P 的样本
+        pred_p_mask = y_pred == 1
+        n_pred_p = int(np.sum(pred_p_mask))
+        n_true_p_in_pred_p = int(np.sum(y_test[pred_p_mask] == 1))
+
+        # 预测为 B 的样本
+        pred_b_mask = y_pred == 0
+        n_pred_b = int(np.sum(pred_b_mask))
+        n_true_b_in_pred_b = int(np.sum(y_test[pred_b_mask] == 0))
+
+        # VUS 区域
+        vus_mask = ~pred_p_mask & ~pred_b_mask
+        n_vus = int(np.sum(vus_mask))
+        n_true_p_in_vus = int(np.sum(y_test[vus_mask] == 1))
+        n_true_b_in_vus = int(np.sum(y_test[vus_mask] == 0))
+
+        # 计算指标
+        # P 侧的精确率：在预测为 P 的样本中，有多少是真 P
+        ppv_p = n_true_p_in_pred_p / n_pred_p if n_pred_p > 0 else 0
+
+        # B 侧的精确率（实际上是对 B 的 NPV）
+        npv_b = n_true_b_in_pred_b / n_pred_b if n_pred_b > 0 else 0
+
+        # 总体统计
+        total_p = int(np.sum(y_test == 1))
+        total_b = int(np.sum(y_test == 0))
+
+        # P 侧的敏感性（真 P 中有多少被正确判为 P，不包括 VUS）
+        sensitivity_p = n_true_p_in_pred_p / total_p if total_p > 0 else 0
+
+        # B 侧的特异性（真 B 中有多少被正确判为 B，不包括 VUS）
+        specificity_b = n_true_b_in_pred_b / total_b if total_b > 0 else 0
+
+        # AUC
+        fpr, tpr, _ = roc_curve(y_test, X_test)
+        roc_auc = auc(fpr, tpr)
+
+        results = {
+            "thresholds": {
+                "p_threshold": float(p_threshold),
+                "b_threshold": float(b_threshold),
+            },
+            "predictions": {
+                "predicted_P": n_pred_p,
+                "predicted_B": n_pred_b,
+                "VUS": n_vus,
+            },
+            "true_labels_in_prediction": {
+                "true_P_predicted_P": n_true_p_in_pred_p,
+                "true_P_in_VUS": n_true_p_in_vus,
+                "true_B_predicted_B": n_true_b_in_pred_b,
+                "true_B_in_VUS": n_true_b_in_vus,
+            },
+            "performance": {
+                "AUC": float(roc_auc),
+                "PPV_P": float(ppv_p),  # P 预测的精确率
+                "NPV_B": float(npv_b),  # B 预测的阴性预测值
+                "sensitivity_P": float(sensitivity_p),  # 真 P 中被判为 P 的比例
+                "specificity_B": float(specificity_b),  # 真 B 中被判为 B 的比例
+                "coverage_P": float(n_pred_p / total_p) if total_p > 0 else 0,
+                "coverage_B": float(n_pred_b / total_b) if total_b > 0 else 0,
+            },
+            "totals": {
+                "total_P": total_p,
+                "total_B": total_b,
+            }
+        }
+
+        logger.info("=" * 50)
+        logger.info("Three-class Benchmark Results:")
+        logger.info("=" * 50)
+        logger.info(f"  P_threshold: {p_threshold:.4f}, B_threshold: {b_threshold:.4f}")
+        logger.info(f"  Predicted P: {n_pred_p} (PPV: {ppv_p:.4f})")
+        logger.info(f"  Predicted B: {n_pred_b} (NPV: {npv_b:.4f})")
+        logger.info(f"  VUS: {n_vus}")
+        logger.info(f"  AUC: {roc_auc:.4f}")
+        logger.info("=" * 50)
+
         return results
 
 

@@ -594,6 +594,20 @@ def cmd_filter_clinvar(args):
     logger.info(f"ClinVar filtering complete")
 
 
+def _count_clinsig(records):
+    """统计临床显著性分类数量"""
+    counts = {
+        "Pathogenic": 0,
+        "Likely_pathogenic": 0,
+        "Benign": 0,
+        "Likely_benign": 0,
+    }
+    for r in records:
+        if r.clinical_significance in counts:
+            counts[r.clinical_significance] += 1
+    return counts
+
+
 def cmd_split_clinvar(args):
     """拆分 ClinVar 数据集（内存优化版）"""
     import pandas as pd
@@ -638,11 +652,52 @@ def cmd_split_clinvar(args):
     ])
     test_df.to_csv(f"{args.output}/test.csv", index=False)
 
-    logger.info(f"Split: Train={len(train_records)}, Test={len(test_records)}")
+    # 输出各组统计
+    train_counts = _count_clinsig(train_records)
+    test_counts = _count_clinsig(test_records)
+
+    logger.info("=" * 50)
+    logger.info("ClinVar Split Statistics:")
+    logger.info("=" * 50)
+    logger.info(f"Train set ({len(train_records)} records):")
+    logger.info(f"  Pathogenic (P):      {train_counts['Pathogenic']:>6}")
+    logger.info(f"  Likely_pathogenic:   {train_counts['Likely_pathogenic']:>6}")
+    logger.info(f"  Benign (B):          {train_counts['Benign']:>6}")
+    logger.info(f"  Likely_benign:       {train_counts['Likely_benign']:>6}")
+    logger.info(f"  Total P:             {train_counts['Pathogenic'] + train_counts['Likely_pathogenic']:>6}")
+    logger.info(f"  Total B:             {train_counts['Benign'] + train_counts['Likely_benign']:>6}")
+    logger.info("")
+    logger.info(f"Test set ({len(test_records)} records):")
+    logger.info(f"  Pathogenic (P):      {test_counts['Pathogenic']:>6}")
+    logger.info(f"  Likely_pathogenic:   {test_counts['Likely_pathogenic']:>6}")
+    logger.info(f"  Benign (B):          {test_counts['Benign']:>6}")
+    logger.info(f"  Likely_benign:       {test_counts['Likely_benign']:>6}")
+    logger.info(f"  Total P:             {test_counts['Pathogenic'] + test_counts['Likely_pathogenic']:>6}")
+    logger.info(f"  Total B:             {test_counts['Benign'] + test_counts['Likely_benign']:>6}")
+    logger.info("=" * 50)
+
+    # 保存统计信息
+    stats = {
+        "train": {
+            "n_records": len(train_records),
+            **train_counts,
+            "Total_P": train_counts["Pathogenic"] + train_counts["Likely_pathogenic"],
+            "Total_B": train_counts["Benign"] + train_counts["Likely_benign"],
+        },
+        "test": {
+            "n_records": len(test_records),
+            **test_counts,
+            "Total_P": test_counts["Pathogenic"] + test_counts["Likely_pathogenic"],
+            "Total_B": test_counts["Benign"] + test_counts["Likely_benign"],
+        },
+    }
+    import json
+    with open(f"{args.output}/split_stats.json", "w") as f:
+        json.dump(stats, f, indent=2)
 
 
 def cmd_calibrate(args):
-    """计算阈值"""
+    """计算阈值（二分类）"""
     import pandas as pd
     from .clinvar_benchmark import ThresholdCalibrator
     import json
@@ -670,8 +725,51 @@ def cmd_calibrate(args):
     logger.info(f"Saved to {args.output}")
 
 
+def cmd_calibrate_three(args):
+    """计算三分类阈值（P_threshold 和 B_threshold）
+
+    原始分数：越负越致病（P），越正越良性（B）
+    分类规则：
+      - score < P_threshold → P（致病）
+      - score > B_threshold → B（良性）
+      - B_threshold < score < P_threshold → VUS
+    """
+    import pandas as pd
+    from .clinvar_benchmark import ThresholdCalibrator
+    import json
+
+    train_df = pd.read_csv(args.input)
+    # 取反分数：ESM-2 分数越负越致病，取反后越高越致病
+    X_train = -train_df["score"].values
+    y_train = (train_df["CLNSIG"].isin(["Pathogenic", "Likely_pathogenic"])).astype(int).values
+
+    p_threshold, b_threshold, metrics = ThresholdCalibrator.calibrate_three_class(
+        X_train, y_train,
+        target_specificity=args.specificity,
+        target_specificity_b=args.specificity_b,
+    )
+
+    result = {
+        "p_threshold": float(p_threshold),
+        "b_threshold": float(b_threshold),
+        "specificity": args.specificity,
+        "specificity_b": args.specificity_b,
+        **metrics
+    }
+    with open(args.output, "w") as f:
+        json.dump(result, f, indent=2)
+
+    logger.info("=" * 50)
+    logger.info("Three-class Thresholds (original scale):")
+    logger.info(f"  P_threshold: {p_threshold:.4f}  (score < {p_threshold:.4f} → P)")
+    logger.info(f"  B_threshold: {b_threshold:.4f}  (score > {b_threshold:.4f} → B)")
+    logger.info(f"  VUS: {b_threshold:.4f} < score < {p_threshold:.4f}")
+    logger.info("=" * 50)
+    logger.info(f"Saved to {args.output}")
+
+
 def cmd_benchmark(args):
-    """Benchmark 评估"""
+    """Benchmark 评估（支持二分类和三分类）"""
     import pandas as pd
     from .clinvar_benchmark import BenchmarkEvaluator
     import json
@@ -681,17 +779,29 @@ def cmd_benchmark(args):
     X_test = -test_df["score"].values
     y_test = (test_df["CLNSIG"].isin(["Pathogenic", "Likely_pathogenic"])).astype(int).values
 
-    # 阈值也需要取反（因为输入的是原始尺度的阈值）
-    threshold_negated = -args.threshold
-    metrics = BenchmarkEvaluator.evaluate(X_test, y_test, threshold_negated)
+    # 三分类模式
+    if args.p_threshold is not None and args.b_threshold is not None:
+        # 传入原始尺度的阈值
+        # P_threshold: 负值（越负越致病）
+        # B_threshold: 负值（但比 P_threshold 大/更正）
+        metrics = BenchmarkEvaluator.evaluate_three_class(
+            X_test, y_test, args.p_threshold, args.b_threshold
+        )
+        result = {
+            "p_threshold": args.p_threshold,
+            "b_threshold": args.b_threshold,
+            **metrics
+        }
+    else:
+        # 二分类模式（向后兼容）
+        threshold_negated = -args.threshold
+        metrics = BenchmarkEvaluator.evaluate(X_test, y_test, threshold_negated)
+        result = {"threshold": args.threshold, **metrics}
 
-    result = {"threshold": args.threshold, **metrics}
     with open(args.output, "w") as f:
         json.dump(result, f, indent=2)
 
-    logger.info(f"AUC: {metrics['auc']:.4f}")
-    logger.info(f"Sensitivity: {metrics['sensitivity']:.4f}")
-    logger.info(f"Specificity: {metrics['specificity']:.4f}")
+    logger.info(f"Benchmark complete. Results saved to {args.output}")
 
 
 def main():
@@ -747,14 +857,22 @@ def main():
     p6.add_argument("--output", required=True, help="Output directory")
     p6.add_argument("--test-size", type=float, default=0.8, help="Test proportion")
 
-    p7 = subparsers.add_parser("calibrate", help="Calibrate threshold")
+    p7 = subparsers.add_parser("calibrate", help="Calibrate threshold (binary)")
     p7.add_argument("--input", required=True, help="Training set CSV")
     p7.add_argument("--output", required=True, help="Output JSON")
     p7.add_argument("--specificity", type=float, default=0.95, help="Target specificity")
 
+    p7b = subparsers.add_parser("calibrate-three", help="Calibrate three-class thresholds (P/B/VUS)")
+    p7b.add_argument("--input", required=True, help="Training set CSV")
+    p7b.add_argument("--output", required=True, help="Output JSON")
+    p7b.add_argument("--specificity", type=float, default=0.95, help="Target specificity for P threshold")
+    p7b.add_argument("--specificity-b", type=float, default=0.95, dest="specificity_b", help="Target specificity for B threshold")
+
     p8 = subparsers.add_parser("benchmark", help="Benchmark on test set")
     p8.add_argument("--input", required=True, help="Test set CSV")
-    p8.add_argument("--threshold", type=float, required=True, help="Decision threshold")
+    p8.add_argument("--threshold", type=float, help="Decision threshold (binary, mutually exclusive with --p-threshold)")
+    p8.add_argument("--p-threshold", type=float, help="P threshold (three-class)")
+    p8.add_argument("--b-threshold", type=float, help="B threshold (three-class)")
     p8.add_argument("--output", required=True, help="Output JSON")
 
     args = parser.parse_args()
@@ -768,6 +886,7 @@ def main():
         "filter-clinvar": cmd_filter_clinvar,
         "split-clinvar": cmd_split_clinvar,
         "calibrate": cmd_calibrate,
+        "calibrate-three": cmd_calibrate_three,
         "benchmark": cmd_benchmark,
     }
 
