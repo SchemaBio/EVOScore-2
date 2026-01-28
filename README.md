@@ -28,7 +28,7 @@ pip install -e .[model]
 ### 转换Parquet到Vcf
 
 ```bash
-evoscore2 to-vcf --scores hg38_VESM_3B_scores.parquet.gzip --output hg38_VESM_3B_scores.vcf.gz
+evoscore2 to-vcf --scores hg38_VESM_3B_scores.parquet.gzip --output hg38_VESM_3B_scores.vcf.gz --backend polars
 ```
 
 ### ClinVar 基准测试流程
