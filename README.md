@@ -38,11 +38,11 @@ evoscore2 to-vcf --scores hg38_VESM_3B_scores.parquet.gzip --output hg38_VESM_3B
 evoscore2 filter-clinvar --input clinvar.vcf.gz --output clinvar_filtered.vcf.gz
 
 # 2. 拆分数据集 (2:8)
-evoscore2 split-clinvar --input clinvar_filtered.vcf.gz --scores scores.parquet --output split_results
+evoscore2 split-clinvar --input clinvar_filtered.vcf.gz --scores hg38_VESM_3B_scores.parquet.gzip --output split_results
 
 # 3. 计算阈值 (训练集)
 evoscore2 calibrate-precision --input split_results/train.csv --output threshold.json --ppv 0.95 --npv 0.95
 
 # 4. Benchmark (测试集)
-evoscore2 benchmark --p-threshold -11.6 --b-threshold -8.5 --output benchmark.json
+evoscore2 benchmark --input split_results/test.csv --p-threshold -11.6 --b-threshold -8.5 --output benchmark.json
 ```
