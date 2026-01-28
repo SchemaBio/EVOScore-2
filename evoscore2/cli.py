@@ -768,6 +768,55 @@ def cmd_calibrate_three(args):
     logger.info(f"Saved to {args.output}")
 
 
+def cmd_calibrate_precision(args):
+    """计算三分类阈值 - 基于精确度滑动法（PPV/NPV）
+
+    方法说明：
+    - PPV方法：从高分向低分扫描，找到PPV正好等于目标值时的阈值
+    - NPV方法：从低分向高分扫描，找到NPV正好等于目标值时的阈值
+
+    原始分数：越负越致病（P），越正越良性（B）
+    分类规则：
+      - score < P_threshold → P（致病）
+      - score > B_threshold → B（良性）
+      - B_threshold < score < P_threshold → VUS
+    """
+    import pandas as pd
+    from .clinvar_benchmark import ThresholdCalibrator
+    import json
+
+    train_df = pd.read_csv(args.input)
+    # 取反分数：ESM-2 分数越负越致病，取反后越高越致病
+    X_train = -train_df["score"].values
+    y_train = (train_df["CLNSIG"].isin(["Pathogenic", "Likely_pathogenic"])).astype(int).values
+
+    p_threshold, b_threshold, metrics = ThresholdCalibrator.calibrate_by_precision(
+        X_train, y_train,
+        target_ppv=args.ppv,
+        target_npv=args.npv,
+    )
+
+    result = {
+        "p_threshold": float(p_threshold),
+        "b_threshold": float(b_threshold),
+        "ppv_target": args.ppv,
+        "npv_target": args.npv,
+        **metrics
+    }
+    with open(args.output, "w") as f:
+        json.dump(result, f, indent=2)
+
+    logger.info("=" * 50)
+    logger.info("Precision-based Thresholds (original scale):")
+    logger.info(f"  P_threshold: {p_threshold:.4f}  (score < {p_threshold:.4f} → P)")
+    logger.info(f"  B_threshold: {b_threshold:.4f}  (score > {b_threshold:.4f} → B)")
+    logger.info(f"  VUS: {b_threshold:.4f} < score < {p_threshold:.4f}")
+    logger.info(f"  PPV target: {args.ppv:.2f}, actual: {metrics.get('p_threshold_config', {}).get('actual_ppv', 'N/A')}")
+    logger.info(f"  NPV target: {args.npv:.2f}, actual: {metrics.get('b_threshold_config', {}).get('actual_npv', 'N/A')}")
+    logger.info("=" * 50)
+    logger.info(f"Saved to {args.output}")
+
+
 def cmd_benchmark(args):
     """Benchmark 评估（支持二分类和三分类）"""
     import pandas as pd
@@ -868,6 +917,12 @@ def main():
     p7b.add_argument("--specificity", type=float, default=0.95, help="Target specificity for P threshold")
     p7b.add_argument("--specificity-b", type=float, default=0.95, dest="specificity_b", help="Target specificity for B threshold")
 
+    p7c = subparsers.add_parser("calibrate-precision", help="Calibrate thresholds by PPV/NPV sliding method")
+    p7c.add_argument("--input", required=True, help="Training set CSV")
+    p7c.add_argument("--output", required=True, help="Output JSON")
+    p7c.add_argument("--ppv", type=float, default=0.90, help="Target PPV (positive predictive value) for P threshold")
+    p7c.add_argument("--npv", type=float, default=0.90, help="Target NPV (negative predictive value) for B threshold")
+
     p8 = subparsers.add_parser("benchmark", help="Benchmark on test set")
     p8.add_argument("--input", required=True, help="Test set CSV")
     p8.add_argument("--threshold", type=float, help="Decision threshold (binary, mutually exclusive with --p-threshold)")
@@ -887,6 +942,7 @@ def main():
         "split-clinvar": cmd_split_clinvar,
         "calibrate": cmd_calibrate,
         "calibrate-three": cmd_calibrate_three,
+        "calibrate-precision": cmd_calibrate_precision,
         "benchmark": cmd_benchmark,
     }
 

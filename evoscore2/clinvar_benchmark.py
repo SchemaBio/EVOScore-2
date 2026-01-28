@@ -381,19 +381,22 @@ class ThresholdCalibrator:
         fpr, tpr, thresholds = roc_curve(y_train, X_train)
         specificities = 1 - fpr
 
-        # ========== P 侧分析：高特异性的前提下最大化灵敏度 ==========
-        # 策略：在满足目标特异性的高分区域点中，选择灵敏度最高的
-        # 这样可以提高PPV（减少假阳性）
+        # ========== P 侧分析：高特异性前提下最大化灵敏度 ==========
+        # 策略：使用比B侧更高的目标特异性（更严格）
+        # 因为P需要更高的精确度（更少的假阳性）
         median_thr = np.median(X_train)
         high_thr_mask = thresholds >= median_thr
         high_thr_indices = np.where(high_thr_mask)[0]
+
+        # P侧使用更高的目标特异性（默认0.98，比B侧更严格）
+        p_target_spec = min(target_specificity + 0.03, 0.99)  # 提高3%
 
         if len(high_thr_indices) > 0:
             high_specs = specificities[high_thr_indices]
             high_tpr = tpr[high_thr_indices]
 
             # 筛选满足目标特异性的高分区域点
-            p_candidate_mask = high_specs >= target_specificity
+            p_candidate_mask = high_specs >= p_target_spec
             p_candidate_indices = high_thr_indices[p_candidate_mask]
 
             if len(p_candidate_indices) > 0:
@@ -401,11 +404,11 @@ class ThresholdCalibrator:
                 p_idx = p_candidate_indices[np.argmax(tpr[p_candidate_indices])]
             else:
                 # 如果没有满足特异性的点，选择高分区域中特异性最接近目标的
-                best_idx = np.argmin(np.abs(high_specs - target_specificity))
+                best_idx = np.argmin(np.abs(high_specs - p_target_spec))
                 p_idx = high_thr_indices[best_idx]
         else:
             # 如果没有高分区域点，用全局满足特异性的点
-            p_idx = np.argmin(np.abs(specificities - target_specificity))
+            p_idx = np.argmin(np.abs(specificities - p_target_spec))
 
         # ========== B 侧分析：低分区域找目标特异性 ==========
         # 低分区域：thresholds <= median，预测 B = X < threshold
@@ -453,10 +456,119 @@ class ThresholdCalibrator:
         }
 
         logger.info(f"Three-class thresholds (original scale): P={p_threshold:.4f}, B={b_threshold:.4f}")
-        logger.info(f"  P_region (max sens at spec>={target_specificity}): "
+        logger.info(f"  P_region (max sens at spec>={p_target_spec:.2f}): "
                     f"spec={1-fpr[p_idx]:.4f}, sens={tpr[p_idx]:.4f}")
-        logger.info(f"  B_region (spec>={target_specificity_b}): "
+        logger.info(f"  B_region (spec>={target_specificity_b:.2f}): "
                     f"spec={1-fpr[b_idx]:.4f}, sens={tpr[b_idx]:.4f}")
+
+        return p_threshold, b_threshold, metrics
+
+    @staticmethod
+    def calibrate_by_precision(
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        target_ppv: float = 0.90,
+        target_npv: float = 0.90,
+    ) -> Tuple[float, float, Dict]:
+        """
+        基于精确度校准阈值（滑动阈值法）
+
+        PPV方法：从高分向低分扫描，找到PPV正好等于目标值时的阈值
+        NPV方法：从低分向高分扫描，找到NPV正好等于目标值时的阈值
+
+        Args:
+            X_train: 训练集分数（取反后，越正越致病）
+            y_train: 训练集标签 (1=致病, 0=良性)
+            target_ppv: 目标阳性预测值（致病精确度）
+            target_npv: 目标阴性预测值（良性精确度）
+
+        Returns:
+            (p_threshold, b_threshold, 校准指标)
+        """
+        from sklearn.metrics import precision_recall_curve
+
+        # PPV分析：预测P（高分区域）
+        # 按分数从高到低排序，计算不同阈值下的PPV
+        sorted_indices = np.argsort(X_train)[::-1]  # 从高到低
+        sorted_scores = X_train[sorted_indices]
+        sorted_labels = y_train[sorted_indices]
+
+        cumulative_tp = np.cumsum(sorted_labels == 1)
+        cumulative_fp = np.cumsum(sorted_labels == 0)
+
+        # PPV = TP / (TP + FP)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ppv_values = cumulative_tp / (cumulative_tp + cumulative_fp)
+            ppv_values = np.nan_to_num(ppv_values, nan=1.0)
+
+        # 找到PPV >= target_ppv的最后一个点（最宽松的阈值）
+        ppv_mask = ppv_values >= target_ppv
+        if np.any(ppv_mask):
+            last_valid_idx = np.where(ppv_mask)[0][-1]
+            # 使用该位置的分数作为阈值（稍微宽松一点确保达到目标）
+            p_thr_neg = sorted_scores[last_valid_idx]
+            actual_ppv = ppv_values[last_valid_idx]
+        else:
+            # 如果没有达到目标，取最高PPV对应的分数
+            best_idx = np.argmax(ppv_values)
+            p_thr_neg = sorted_scores[best_idx]
+            actual_ppv = ppv_values[best_idx]
+
+        # NPV分析：预测B（低分区域）
+        # 按分数从低到高排序，计算不同阈值下的NPV
+        sorted_indices = np.argsort(X_train)  # 从低到高
+        sorted_scores = X_train[sorted_indices]
+        sorted_labels = y_train[sorted_indices]
+
+        cumulative_tn = np.cumsum(sorted_labels == 0)
+        cumulative_fn = np.cumsum(sorted_labels == 1)
+
+        # NPV = TN / (TN + FN)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            npv_values = cumulative_tn / (cumulative_tn + cumulative_fn)
+            npv_values = np.nan_to_num(npv_values, nan=1.0)
+
+        # 找到NPV >= target_npv的最后一个点（最宽松的阈值）
+        npv_mask = npv_values >= target_npv
+        if np.any(npv_mask):
+            last_valid_idx = np.where(npv_mask)[0][-1]
+            b_thr_neg = sorted_scores[last_valid_idx]
+            actual_npv = npv_values[last_valid_idx]
+        else:
+            best_idx = np.argmax(npv_values)
+            b_thr_neg = sorted_scores[best_idx]
+            actual_npv = npv_values[best_idx]
+
+        # 转回原始尺度
+        # 原始尺度：P_threshold < B_threshold
+        p_threshold = -p_thr_neg
+        b_threshold = -b_thr_neg
+
+        # 确保 P < B
+        if p_threshold >= b_threshold:
+            p_thr_neg = np.percentile(X_train, 80)
+            b_thr_neg = np.percentile(X_train, 20)
+            p_threshold = -p_thr_neg
+            b_threshold = -b_thr_neg
+            logger.warning(f"Thresholds adjusted: P={p_threshold:.4f}, B={b_threshold:.4f}")
+
+        metrics = {
+            "method": "precision_sliding",
+            "p_threshold_config": {
+                "target_ppv": target_ppv,
+                "actual_ppv": float(actual_ppv),
+            },
+            "b_threshold_config": {
+                "target_npv": target_npv,
+                "actual_npv": float(actual_npv),
+            },
+            "p_threshold": float(p_threshold),
+            "b_threshold": float(b_threshold),
+        }
+
+        logger.info(f"Precision-based thresholds (original scale): P={p_threshold:.4f}, B={b_threshold:.4f}")
+        logger.info(f"  PPV target: {target_ppv:.2f}, actual: {actual_ppv:.4f}")
+        logger.info(f"  NPV target: {target_npv:.2f}, actual: {actual_npv:.4f}")
 
         return p_threshold, b_threshold, metrics
 
